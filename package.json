@@ -1,0 +1,12 @@
+{
+  "name": "mexc-futures-trading-bot",
+  "version": "34.4.8-stoploss-protection-fixed",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
