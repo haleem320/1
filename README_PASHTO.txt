@@ -1,4 +1,4 @@
-v34.9.0 — ROBUST PULLBACK ENTRY / ANTI-CHASE
+v34.9.1 — RISK GUARD / ROBUST PULLBACK ENTRY / ANTI-CHASE
 دا نسخه د تېرو Entry ستونزو د بنسټیز اصلاح لپاره جوړه شوې ده.
 
 اصلي ستراتیژي:
@@ -14,7 +14,10 @@ v34.9.0 — ROBUST PULLBACK ENTRY / ANTI-CHASE
 - ناوخته Entry د impulse ATR، room-to-extreme، EMA distance، S/R او timing checks له لارې رد کېږي.
 - Structure-based SL ساتل شوی؛ ډېر تنګ default SL نه منل کېږي.
 - د LONG/SHORT direction invariant ساتل شوی؛ signal او order direction باید عین وي.
-- Position count د Entry blocker نه دی، مګر په هماغه symbol کې موجود position بیا Entry ته نه پرېږدي.
+- Max Open Positions=6 په فعال ډول نافذ دی؛ په هماغه symbol کې duplicate position هم نه پرېږدي.
+- Initial TP=2% دی؛ د قوي momentum په صورت کې adaptive TP غځېدای شي.
+- Leverage تر 12x محدود دی؛ که contract د exchange له خوا ټیټ حد ولري، هماغه حد کارول کېږي.
+- Break-even د 2% ګټې شاوخوا فعالېږي او trailing stop د 3% ګټې وروسته د قیمت شاته حرکت کوي؛ stop هېڅکله شاته نه پراخېږي.
 - هدف: لږې خو د ښه Entry ځای لرونکې معاملې؛ د trade شمېر د مجبورولو لپاره مصنوعي signal نه جوړېږي.
 
 مهم:

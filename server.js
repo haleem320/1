@@ -102,16 +102,15 @@ const NEWS_HIGH_RISK_TERMS = [
   "liquidation","liquidated","lawsuit","fraud","stolen funds","critical vulnerability","depeg","de-pegged"
 ];
 const NEWS_MARKET_RISK_TERMS = ["exchange collapse","exchange hacked","market crash","emergency halt","trading suspended"];
-const TARGET_LEVERAGE = Math.max(1, Number(process.env.TARGET_LEVERAGE || 20));
+const TARGET_LEVERAGE = Math.max(1, Math.min(12, Number(process.env.TARGET_LEVERAGE || 12)));
 const CONFIGURED_OPEN_TYPE = Math.max(1, Math.min(2, Number(process.env.OPEN_TYPE || 1)));
 const CONFIGURED_POSITION_MODE = Math.max(1, Math.min(2, Number(process.env.POSITION_MODE || 2)));
 const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || 0.02);
-const CONFIGURED_TAKE_PROFIT_PCT = Number(process.env.TAKE_PROFIT_PCT || 0.035);
+const CONFIGURED_TAKE_PROFIT_PCT = Number(process.env.TAKE_PROFIT_PCT || 0.02);
 const FORCE_AUTO_STOP_LOSS = String(process.env.FORCE_AUTO_STOP_LOSS ?? "true").toLowerCase() === "true";
 const MANUAL_STOP_LOSS = FORCE_AUTO_STOP_LOSS ? false : String(process.env.MANUAL_STOP_LOSS ?? "false").toLowerCase() === "true";
-// Runner mode: use a distant 10% protective TP so strong moves are not cut at 2.5%.
-// From +2.5%, the existing trailing/break-even manager protects the profit.
-const TAKE_PROFIT_PCT = Math.max(0.025, Math.min(0.045, CONFIGURED_TAKE_PROFIT_PCT));
+// Initial take profit is 2%; adaptive TP may extend it when momentum remains strong.
+const TAKE_PROFIT_PCT = Math.max(0.02, Math.min(0.045, CONFIGURED_TAKE_PROFIT_PCT));
 const ADAPTIVE_TP_ENABLED = String(process.env.ADAPTIVE_TP_ENABLED ?? "true").toLowerCase() === "true";
 const ADAPTIVE_TP_START_PCT = TAKE_PROFIT_PCT;
 const ADAPTIVE_TP_MAX_PCT = Math.max(TAKE_PROFIT_PCT, Math.min(0.15, Number(process.env.ADAPTIVE_TP_MAX_PCT || 0.15)));
@@ -153,17 +152,13 @@ const BREAK_EVEN_TRIGGER_PCT = Math.max(0, Number(process.env.BREAK_EVEN_TRIGGER
 const BREAK_EVEN_OFFSET_PCT = Math.max(0, Number(process.env.BREAK_EVEN_OFFSET_PCT || 0.0015));
 const TRAILING_STOP_ENABLED =
   !MANUAL_STOP_LOSS && String(process.env.TRAILING_STOP_ENABLED ?? "true").toLowerCase() === "true";
-const TRAILING_TRIGGER_PCT = Math.max(0.025, Number(process.env.TRAILING_TRIGGER_PCT || 0.06));
-const TRAILING_STOP_PCT = Math.max(0.001, Number(process.env.TRAILING_STOP_PCT || 0.025));
+const TRAILING_TRIGGER_PCT = Math.max(0.02, Number(process.env.TRAILING_TRIGGER_PCT || 0.03));
+const TRAILING_STOP_PCT = Math.max(0.001, Math.min(0.02, Number(process.env.TRAILING_STOP_PCT || 0.012)));
 const MIN_STOP_DISTANCE_PCT = Math.max(0.0005, Number(process.env.MIN_STOP_DISTANCE_PCT || 0.001));
-// v34.8.1: POSITION COUNT IS NOT AN ENTRY BLOCKER BY DEFAULT.
-// The bot may hold multiple positions on different symbols. A same-symbol
-// position is still checked by preflight so the bot does not duplicate an
-// existing position/order on the same contract. Set POSITION_LIMIT_ENABLED=true
-// only if an operator explicitly wants a global position cap.
-const POSITION_LIMIT_ENABLED = String(process.env.POSITION_LIMIT_ENABLED ?? "false").toLowerCase() === "true";
-const MAX_OPEN_POSITIONS = Math.max(1, Number(process.env.MAX_OPEN_POSITIONS || 9999));
-const MAX_SAME_DIRECTION_POSITIONS = Math.max(1, Number(process.env.MAX_SAME_DIRECTION_POSITIONS || 9999));
+// Enforce the configured global position cap by default.
+const POSITION_LIMIT_ENABLED = String(process.env.POSITION_LIMIT_ENABLED ?? "true").toLowerCase() === "true";
+const MAX_OPEN_POSITIONS = Math.max(1, Math.min(6, Number(process.env.MAX_OPEN_POSITIONS || 6)));
+const MAX_SAME_DIRECTION_POSITIONS = Math.max(1, Math.min(MAX_OPEN_POSITIONS, Number(process.env.MAX_SAME_DIRECTION_POSITIONS || 6)));
 const MAX_PREFLIGHT_CANDIDATES = Math.max(5, Math.min(20, Number(process.env.MAX_PREFLIGHT_CANDIDATES || 15)));
 const MAX_TRADES_PER_DAY = Math.max(1, Number(process.env.MAX_TRADES_PER_DAY || 50));
 const ENTRY_COOLDOWN_MINUTES = 0; // No artificial time-based entry blocker; setup quality and live risk checks decide.
@@ -1431,7 +1426,7 @@ function timeframeBias(candles) {
 function entryTimingGuard(candles, direction, price, atr14, trigger) {
   const closed = Array.isArray(candles) ? candles.slice(0, -1) : [];
   if (closed.length < 25 || !Number.isFinite(price) || !(atr14 > 0)) {
-    return {pass:true, reason:null, impulseAtr:null, roomToExtremeAtr:null, recentLow:null, recentHigh:null};
+    return {pass:false, reason:"Entry timing rejected: insufficient closed-candle/ATR data to verify late-entry risk", impulseAtr:null, roomToExtremeAtr:null, recentLow:null, recentHigh:null};
   }
   const window = closed.slice(-20);
   const recentLow = Math.min(...window.map(c => Number(c.low)).filter(Number.isFinite));
