@@ -14,7 +14,7 @@ v34.9.1 — RISK GUARD / ROBUST PULLBACK ENTRY / ANTI-CHASE
 - ناوخته Entry د impulse ATR، room-to-extreme، EMA distance، S/R او timing checks له لارې رد کېږي.
 - Structure-based SL ساتل شوی؛ ډېر تنګ default SL نه منل کېږي.
 - د LONG/SHORT direction invariant ساتل شوی؛ signal او order direction باید عین وي.
-- Max Open Positions=6 په فعال ډول نافذ دی؛ په هماغه symbol کې duplicate position هم نه پرېږدي.
+- Max Open Positions=3 په فعال ډول نافذ دی؛ په هماغه symbol کې duplicate position هم نه پرېږدي.
 - Initial TP=2% دی؛ د قوي momentum په صورت کې adaptive TP غځېدای شي.
 - Leverage تر 12x محدود دی؛ که contract د exchange له خوا ټیټ حد ولري، هماغه حد کارول کېږي.
 - Break-even د 2% ګټې شاوخوا فعالېږي او trailing stop د 3% ګټې وروسته د قیمت شاته حرکت کوي؛ stop هېڅکله شاته نه پراخېږي.
@@ -96,3 +96,6 @@ v34.8.4 — NO-LATE-ENTRY / SMART PULLBACK
 - زوړ/stale retest که له 6 closed 15m candles څخه ډېر تېر وي او حرکت ډېر غټ شوی وي، ردوي.
 - د حقیقي pullback لپاره لږ تر لږه 0.55 ATR ژوروالی غواړي کله چې بازار ډېر غځېدلی وي.
 - هدف: د XMR/EUL په شان د لوی حرکت په پای کې LONG/SHORT نه اخیستل؛ Bot باید Pullback/Re-test ته انتظار وباسي او بیا بل coin وازمويي.
+
+
+نسخه v34.9.2: MAX_OPEN_POSITIONS=3 او MAX_SAME_DIRECTION_POSITIONS=3؛ د کوډ دننه حد هم تر ۳ محدود دی.

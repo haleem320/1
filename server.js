@@ -157,8 +157,8 @@ const TRAILING_STOP_PCT = Math.max(0.001, Math.min(0.02, Number(process.env.TRAI
 const MIN_STOP_DISTANCE_PCT = Math.max(0.0005, Number(process.env.MIN_STOP_DISTANCE_PCT || 0.001));
 // Enforce the configured global position cap by default.
 const POSITION_LIMIT_ENABLED = String(process.env.POSITION_LIMIT_ENABLED ?? "true").toLowerCase() === "true";
-const MAX_OPEN_POSITIONS = Math.max(1, Math.min(6, Number(process.env.MAX_OPEN_POSITIONS || 6)));
-const MAX_SAME_DIRECTION_POSITIONS = Math.max(1, Math.min(MAX_OPEN_POSITIONS, Number(process.env.MAX_SAME_DIRECTION_POSITIONS || 6)));
+const MAX_OPEN_POSITIONS = Math.max(1, Math.min(3, Number(process.env.MAX_OPEN_POSITIONS || 3)));
+const MAX_SAME_DIRECTION_POSITIONS = Math.max(1, Math.min(MAX_OPEN_POSITIONS, Number(process.env.MAX_SAME_DIRECTION_POSITIONS || 3)));
 const MAX_PREFLIGHT_CANDIDATES = Math.max(5, Math.min(20, Number(process.env.MAX_PREFLIGHT_CANDIDATES || 15)));
 const MAX_TRADES_PER_DAY = Math.max(1, Number(process.env.MAX_TRADES_PER_DAY || 50));
 const ENTRY_COOLDOWN_MINUTES = 0; // No artificial time-based entry blocker; setup quality and live risk checks decide.
