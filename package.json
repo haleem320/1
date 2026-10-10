@@ -1,8 +1,11 @@
 {
   "name": "mexc-futures-trading-bot",
-  "version": "34.9.0-robust-pullback-entry",
+  "version": "34.9.2-robust-pullback-entry",
   "private": true,
   "main": "server.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "start": "node server.js"
   },
