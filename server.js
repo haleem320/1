@@ -1803,4 +1803,1522 @@ function samePrice(a, b, contract, ticks = 2) {
 }
 
 function protectionSemanticallyValid(direction, referencePrice, stop, take) {
-  const ref =
+  const ref = num(referencePrice), sl = num(stop), tp = num(take);
+  if (!(ref > 0 && sl > 0 && tp > 0)) return false;
+  return direction === "LONG" ? (sl < ref && tp > ref) : direction === "SHORT" ? (sl > ref && tp < ref) : false;
+}
+
+function positionVolume(position) {
+  return num(position?.holdVol ?? position?.vol ?? position?.volume ?? position?.positionVol) || 0;
+}
+
+function positionIdOf(position) {
+  return position?.positionId ?? position?.positionID ?? position?.id;
+}
+
+function positionDirection(position) {
+  const t = Number(position?.positionType ?? position?.position_type ?? position?.type);
+  if (t === 1) return "LONG";
+  if (t === 2) return "SHORT";
+  const side = Number(position?.side);
+  if (side === 1) return "LONG";
+  if (side === 3) return "SHORT";
+  const text = String(position?.positionType ?? position?.side ?? "").toUpperCase();
+  if (text.includes("LONG")) return "LONG";
+  if (text.includes("SHORT")) return "SHORT";
+  return null;
+}
+
+function entryPriceOf(position) {
+  return num(position?.openAvgPrice ?? position?.openAvgPx ?? position?.avgPrice ?? position?.holdAvgPrice ?? position?.positionAvgPrice ?? position?.entryPrice);
+}
+
+function stopOrderIdOf(order) {
+  return order?.id ?? order?.orderId ?? order?.stopPlanOrderId ?? order?.stopOrderId;
+}
+
+function protectionPricesFor(direction, entryPrice, contract, atr14 = null, structure = null) {
+  if (!(entryPrice > 0) || !["LONG", "SHORT"].includes(direction)) {
+    return { stop: null, take: null, tpPct: TAKE_PROFIT_PCT, stopPct: 0, manualStopLoss: false, valid: false, reason: "Invalid entry direction/price" };
+  }
+
+  const take = direction === "LONG"
+    ? roundPrice(entryPrice * (1 + TAKE_PROFIT_PCT), contract)
+    : roundPrice(entryPrice * (1 - TAKE_PROFIT_PCT), contract);
+
+  const minPct = STRUCTURE_STOP_MIN_PCT;
+  const maxPct = MAX_STRUCTURE_STOP_PCT;
+  const buffer = Math.max(0, Number(atr14) || 0) * STRUCTURE_STOP_BUFFER_ATR;
+  const swing = direction === "LONG"
+    ? num(structure?.pullbackLow ?? structure?.retestExtreme ?? structure?.swingLow)
+    : num(structure?.pullbackHigh ?? structure?.retestExtreme ?? structure?.swingHigh);
+  const structural = direction === "LONG"
+    ? (swing !== null ? swing - buffer : null)
+    : (swing !== null ? swing + buffer : null);
+
+  const minimumStop = direction === "LONG" ? entryPrice * (1 - minPct) : entryPrice * (1 + minPct);
+  const maximumStop = direction === "LONG" ? entryPrice * (1 - maxPct) : entryPrice * (1 + maxPct);
+
+  let stopRaw;
+  if (direction === "LONG") {
+    stopRaw = structural !== null ? Math.min(structural, minimumStop) : minimumStop;
+    if (stopRaw < maximumStop) {
+      return { stop: null, take, tpPct: TAKE_PROFIT_PCT, stopPct: Math.abs((entryPrice - stopRaw) / entryPrice), manualStopLoss: false, valid: false, reason: `Structure SL too wide (> ${(maxPct * 100).toFixed(2)}%)` };
+    }
+  } else {
+    stopRaw = structural !== null ? Math.max(structural, minimumStop) : minimumStop;
+    if (stopRaw > maximumStop) {
+      return { stop: null, take, tpPct: TAKE_PROFIT_PCT, stopPct: Math.abs((stopRaw - entryPrice) / entryPrice), manualStopLoss: false, valid: false, reason: `Structure SL too wide (> ${(maxPct * 100).toFixed(2)}%)` };
+    }
+  }
+
+  const stop = roundPrice(stopRaw, contract);
+  const stopPct = Math.abs(stop - entryPrice) / entryPrice;
+  const semanticOk = protectionSemanticallyValid(direction, entryPrice, stop, take);
+  const roundedBandOk = stopPct > 0 && stopPct <= maxPct * 1.02;
+  const valid = Boolean(stop > 0 && semanticOk && roundedBandOk);
+  return {
+    stop, take, tpPct: TAKE_PROFIT_PCT, stopPct, manualStopLoss: false, valid,
+    method: structural !== null ? "STRUCTURE_SWING_ATR_BUFFER" : "MIN_DISTANCE",
+    swingPrice: swing, bufferAtr: STRUCTURE_STOP_BUFFER_ATR, minStopPct: minPct, maxStopPct: maxPct,
+    reason: valid ? null : (semanticOk ? `Structure SL too wide (> ${(maxPct * 100).toFixed(2)}%)` : "Invalid structure-based protection")
+  };
+}
+
+function adaptiveTpLevel(direction, entryPrice, currentTake, marketPrice, analysis) {
+  if (!ADAPTIVE_TP_ENABLED || !(entryPrice > 0) || !(marketPrice > 0) || !analysis) return null;
+  const profit = profitableMovePct(direction, entryPrice, marketPrice);
+  if (profit < ADAPTIVE_TP_EXTEND_TRIGGER_PCT) return null;
+  const slope = num(analysis.momentumSlope), adx14 = num(analysis.adx14), rsi14 = num(analysis.rsi14);
+  const strong = analysis.higherTimeframeAligned === true && (
+    (direction === "LONG" && analysis.direction === "LONG" && slope !== null && slope > 0 && (adx14 === null || adx14 >= ADAPTIVE_TP_STRONG_ADX) && (rsi14 === null || rsi14 <= 82)) ||
+    (direction === "SHORT" && analysis.direction === "SHORT" && slope !== null && slope < 0 && (adx14 === null || adx14 >= ADAPTIVE_TP_STRONG_ADX) && (rsi14 === null || rsi14 >= 18))
+  );
+  if (!strong) return null;
+  const currentPct = Math.abs((num(currentTake) - entryPrice) / entryPrice);
+  const desired = Math.min(ADAPTIVE_TP_MAX_PCT, profit + ADAPTIVE_TP_STEP_PCT);
+  const nextPct = Math.min(ADAPTIVE_TP_MAX_PCT, Math.max(ADAPTIVE_TP_START_PCT, currentPct + ADAPTIVE_TP_STEP_PCT, desired));
+  if (nextPct <= currentPct + 0.0025) return null;
+  return { targetPct: nextPct, profitPct: profit, momentumSlope: slope, adx14, rsi14, higherTimeframeAligned: true };
+}
+
+const pendingProtectionByPosition = new Map();
+
+async function ensureProtection(symbol, direction, position, stop, take, contract, referencePrice = null) {
+  take = roundPrice(take, contract);
+  const pid = positionIdOf(position);
+  const vol = positionVolume(position);
+  const positionReference = num(referencePrice ?? entryPriceOf(position));
+  if (!(take > 0) || !positionReference) return { protected: false, reason: "invalid take-profit or position reference" };
+  if (pid === undefined || pid === null || vol <= 0) return { protected: false, reason: "position id/volume not available" };
+
+  const pendingKey = `${symbol}:${pid}`;
+  const pending = pendingProtectionByPosition.get(pendingKey);
+  if (pending) pendingProtectionByPosition.delete(pendingKey);
+
+  const wantedType = direction === "LONG" ? 1 : 2;
+  const isLiveProtection = (x) => {
+    const state = Number(x?.state), finished = Number(x?.isFinished);
+    return (!Number.isFinite(state) || state === 1) && (!Number.isFinite(finished) || finished === 0);
+  };
+  const findMatch = (rows) => {
+    const live = rows.filter(isLiveProtection);
+    const exact = live.find(x => String(x?.positionId ?? "") === String(pid));
+    if (exact) return exact;
+    const fallback = live.filter(x => String(x?.symbol || "").toUpperCase() === String(symbol).toUpperCase() && Number(x?.positionType) === wantedType && !x?.positionId);
+    return fallback.length === 1 ? fallback[0] : null;
+  };
+  const tpMatches = (match) => !!match && num(match.takeProfitPrice) !== null && samePrice(match.takeProfitPrice, take, contract, 2) && (stop === null || num(match.stopLossPrice) !== null);
+  const liveTpMatchesPosition = (rows) => rows.filter(isLiveProtection).filter(x => String(x?.positionId ?? "") === String(pid)).filter(x => num(x?.takeProfitPrice) !== null);
+
+  let tpsl = await getOpenTPSL(symbol);
+  let match = findMatch(tpsl);
+  const existingTpOrders = liveTpMatchesPosition(tpsl);
+
+  if (existingTpOrders.length > 0) {
+    const existing = existingTpOrders.find(tpMatches) || existingTpOrders[0];
+    if (existingTpOrders.length > 1) console.log("TP/SL DUPLICATE DETECTED", JSON.stringify({ symbol, direction, positionId: pid, count: existingTpOrders.length }));
+    if (num(existing.stopLossPrice) !== null && tpMatches(existing)) {
+      return { protected: true, positionId: pid, volume: vol, stopLossPrice: existing.stopLossPrice, takeProfitPrice: existing.takeProfitPrice, tpsl: existing, manualStopLoss: false, duplicateTpCount: existingTpOrders.length };
+    }
+    const existingId = stopOrderIdOf(existing);
+    let upgradeError = null;
+    if (existingId !== undefined && existingId !== null && stop > 0) {
+      try {
+        await mexc("POST", "/api/v1/private/stoporder/change_price", { orderId: existingId, stopLossPrice: stop, takeProfitPrice: take }, true);
+        await new Promise(r => setTimeout(r, 500));
+        const verifyRows = await getOpenTPSL(symbol);
+        const verified = verifyRows.find(x => String(x.positionId ?? "") === String(pid) && (!x.state || Number(x.state) === 1));
+        if (verified && num(verified.stopLossPrice) !== null && num(verified.takeProfitPrice) !== null && samePrice(verified.stopLossPrice, stop, contract) && samePrice(verified.takeProfitPrice, take, contract)) {
+          return { protected: true, positionId: pid, volume: vol, stopLossPrice: verified.stopLossPrice, takeProfitPrice: verified.takeProfitPrice, tpsl: verified, manualStopLoss: false, upgradedExisting: true };
+        }
+        upgradeError = "combined TP/SL change was not verified";
+      } catch (e) {
+        upgradeError = e.message;
+        console.log("TP/SL EXISTING ORDER UPGRADE FAILED", JSON.stringify({ symbol, direction, positionId: pid, error: e.message }));
+      }
+      try {
+        await mexc("POST", "/api/v1/private/stoporder/change_price", { orderId: existingId, stopLossPrice: stop }, true);
+        await new Promise(r => setTimeout(r, 500));
+        const verifyRows = await getOpenTPSL(symbol);
+        const verified = verifyRows.find(x => String(x.positionId ?? "") === String(pid) && (!x.state || Number(x.state) === 1));
+        if (verified && num(verified.stopLossPrice) !== null && num(verified.takeProfitPrice) !== null && samePrice(verified.stopLossPrice, stop, contract) && samePrice(verified.takeProfitPrice, take, contract)) {
+          return { protected: true, positionId: pid, volume: vol, stopLossPrice: verified.stopLossPrice, takeProfitPrice: verified.takeProfitPrice, tpsl: verified, manualStopLoss: false, upgradedExisting: true, slOnlyRetry: true };
+        }
+        upgradeError = "SL-only retry was not verified";
+      } catch (e) {
+        upgradeError = e.message;
+        console.log("TP/SL EXISTING SL-ONLY RETRY FAILED", JSON.stringify({ symbol, direction, positionId: pid, error: e.message }));
+      }
+    }
+    return {
+      protected: false, protectionAccepted: false, verificationPending: false, safeToHold: false,
+      positionId: pid, volume: vol, stopLossPrice: existing.stopLossPrice ?? null,
+      takeProfitPrice: existing.takeProfitPrice, tpsl: existing, manualStopLoss: false,
+      error: upgradeError || "Existing TP found but automatic SL could not be verified"
+    };
+  }
+
+  let lastError = null, placementAccepted = false, placeResult = null;
+  for (let placementAttempt = 1; placementAttempt <= 2 && !placementAccepted; placementAttempt++) {
+    try {
+      placeResult = await mexc("POST", "/api/v1/private/stoporder/place", {
+        positionId: pid, vol, stopLossPrice: stop, takeProfitPrice: take,
+        profitTrend: direction === "LONG" ? 2 : 1,
+        profitLossVolType: "SAME", volType: 1, positionMode: 1
+      }, true);
+      placementAccepted = true;
+      pendingProtectionByPosition.set(pendingKey, { at: Date.now(), stop, take, result: placeResult });
+      console.log("TP/SL PLACE ACCEPTED", JSON.stringify({ symbol, direction, positionId: pid, requestedStop: stop, requestedTake: take, placementAttempt, stopLoss: "AUTO_STRUCTURE", result: placeResult?.data ?? placeResult ?? null }));
+    } catch (e) {
+      lastError = e.message;
+      console.log("TP/SL PLACE FAILED", JSON.stringify({ symbol, direction, positionId: pid, requestedStop: stop, requestedTake: take, placementAttempt, stopLoss: "AUTO_STRUCTURE", error: e.message }));
+      if (placementAttempt < 2) await new Promise(r => setTimeout(r, PROTECTION_VERIFY_DELAY_MS));
+    }
+  }
+
+  if (placementAccepted) {
+    for (let attempt = 1; attempt <= PROTECTION_VERIFY_RETRIES; attempt++) {
+      await new Promise(r => setTimeout(r, PROTECTION_VERIFY_DELAY_MS));
+      tpsl = await getOpenTPSL(symbol);
+      match = findMatch(tpsl);
+      console.log("TP/SL VERIFY", JSON.stringify({ symbol, direction, positionId: pid, attempt, requestedStop: stop, requestedTake: take, matched: match ? { id: stopOrderIdOf(match), positionId: match.positionId ?? null, state: match.state ?? null, isFinished: match.isFinished ?? null, stop: match.stopLossPrice ?? null, take: match.takeProfitPrice ?? null } : null }));
+      if (tpMatches(match)) {
+        pendingProtectionByPosition.delete(pendingKey);
+        return { protected: true, verifiedAttempt: attempt, positionId: pid, volume: vol, stopLossPrice: match.stopLossPrice ?? stop, takeProfitPrice: match.takeProfitPrice, tpsl: match, placement: placeResult, manualStopLoss: false };
+      }
+    }
+  }
+
+  if (placementAccepted) {
+    const verifiedStop = num(match?.stopLossPrice);
+    const verifiedTake = num(match?.takeProfitPrice);
+    const hasBoth = verifiedStop !== null && verifiedTake !== null && samePrice(verifiedStop, stop, contract, 2) && samePrice(verifiedTake, take, contract, 2);
+    return {
+      protected: false, protectionAccepted: true, safeToHold: false, verificationPending: !hasBoth,
+      positionId: pid, volume: vol, stopLossPrice: verifiedStop ?? stop, takeProfitPrice: verifiedTake ?? take,
+      tpsl: match || null, placement: placeResult, manualStopLoss: false,
+      reason: hasBoth ? "TP/SL placement accepted but protection confirmation is pending" : "TP/SL placement accepted but SL is not verified; position is NOT protected"
+    };
+  }
+
+  return {
+    protected: false, positionId: pid, volume: vol,
+    stopLossPrice: match?.stopLossPrice ?? stop, takeProfitPrice: match?.takeProfitPrice ?? null,
+    tpsl: match || null, placement: placeResult, manualStopLoss: false,
+    error: lastError || "Take-profit could not be placed or verified"
+  };
+}
+
+function logExitReason(data) {
+  console.log("EXIT REASON", JSON.stringify({
+    time: new Date().toISOString(),
+    symbol: data?.symbol || null, direction: data?.direction || null,
+    positionId: data?.positionId ?? null, entryPrice: data?.entryPrice ?? null,
+    closePrice: data?.closePrice ?? null, reason: data?.reason || "UNKNOWN",
+    tp: data?.takeProfitPrice ?? null, sl: data?.stopLossPrice ?? null,
+    tpslConfirmed: data?.tpslConfirmed ?? null, detail: data?.detail || null
+  }));
+}
+
+// ============================================================
+// MARKET ORDER
+// ============================================================
+async function placeMarketOrder(symbol, direction) {
+  if (!REAL_TRADING_ENABLED) throw new Error("REAL_TRADING_ENABLED is false");
+  symbol = String(symbol || "").toUpperCase();
+  await refreshActiveSymbols(true);
+  await ensureTradableSymbol(symbol);
+  if (!["LONG", "SHORT"].includes(direction)) throw new Error("Direction must be LONG or SHORT");
+
+  const pf = await preflight(symbol);
+  if (!pf.ready) throw new Error("Preflight failed: " + JSON.stringify(pf));
+  const finalSignalDirection = String(pf.signal?.signal || "WAIT").toUpperCase();
+  if (finalSignalDirection !== direction) {
+    throw new Error(`FINAL DIRECTION MISMATCH - ORDER BLOCKED (requested ${direction}, live signal ${finalSignalDirection})`);
+  }
+
+  const side = direction === "LONG" ? 1 : 3;
+  const targetPlan = protectionPricesFor(direction, pf.price, pf.contract, pf.signal?.atr14, pf.signal?.breakout);
+  const stop = targetPlan.stop;
+  const take = targetPlan.take;
+  if (!targetPlan.valid || !(stop > 0)) throw new Error(`Protection plan rejected: ${targetPlan.reason || "unsafe structure stop"}`);
+
+  let order;
+  try {
+    order = await mexc("POST", "/api/v1/private/order/create", {
+      symbol, price: 0, vol: pf.volume, side, type: 5,
+      openType: pf.actualOpenType, leverage: pf.effectiveLeverage,
+      positionMode: pf.actualPositionMode
+    }, true);
+  } catch (e) {
+    throw new Error(`ENTRY ORDER FAILED (no TP/SL attached): ${e.message}`);
+  }
+
+  let position = null;
+  for (let i = 0; i < 10; i++) {
+    await new Promise(r => setTimeout(r, 700));
+    const ps = await getPositions(symbol);
+    position = ps.find(p => num(p?.holdVol ?? p?.vol ?? p?.volume) > 0) || null;
+    if (position) break;
+  }
+
+  if (!position) return { success: true, order, protected: false, warning: "Order accepted but position not visible yet" };
+
+  const ps2 = await getPositions(symbol);
+  const livePos = ps2.find(p => String(positionIdOf(p)) === String(positionIdOf(position))) || position;
+  const entryPrice = num(livePos?.openAvgPrice ?? livePos?.openAvgPx ?? livePos?.avgPrice ?? livePos?.holdAvgPrice ?? livePos?.positionAvgPrice ?? livePos?.entryPrice) || pf.price;
+  const targetPlanFromEntry = protectionPricesFor(direction, entryPrice, pf.contract, pf.signal?.atr14, pf.signal?.breakout);
+  const stopFromEntry = targetPlanFromEntry.stop;
+  const takeFromEntry = targetPlanFromEntry.take;
+
+  if (!targetPlanFromEntry.valid || !(stopFromEntry > 0)) {
+    console.log("POST-ENTRY PROTECTION PLAN INVALID", JSON.stringify({ symbol, direction, positionId: positionIdOf(livePos), entryPrice, reason: targetPlanFromEntry.reason || "unsafe structure stop" }));
+  }
+
+  let protection;
+  try {
+    protection = await ensureProtection(symbol, direction, livePos, stopFromEntry, takeFromEntry, pf.contract, entryPrice);
+  } catch (e) {
+    console.log("TP-ONLY PROTECTION ERROR - HOLD POSITION", JSON.stringify({ symbol, direction, positionId: positionIdOf(livePos), entryPrice, stopLossPrice: stopFromEntry, takeProfitPrice: takeFromEntry, stopLoss: "AUTO_STRUCTURE", error: e.message }));
+    return { success: true, order, position: livePos, protected: false, verificationPending: true, safeToHold: true, entryPrice, stopLossPrice: stopFromEntry, takeProfitPrice: takeFromEntry, warning: "TP/SL placement/verification pending; automatic structure SL is being verified." };
+  }
+
+  if (!protection.protected) {
+    console.log("TP-ONLY VERIFICATION PENDING - HOLD POSITION", JSON.stringify({ symbol, direction, positionId: positionIdOf(livePos), entryPrice, stopLossPrice: stopFromEntry, stopLoss: "AUTO_STRUCTURE", takeProfitPrice: takeFromEntry }));
+    return {
+      success: true, order, position: livePos, protected: false,
+      protectionAccepted: protection.protectionAccepted, verificationPending: true,
+      safeToHold: true, entryPrice, stopLossPrice: stopFromEntry, takeProfitPrice: takeFromEntry,
+      protection, warning: "Automatic structure-based SL/TP is pending verification."
+    };
+  }
+
+  console.log("TP/SL PROTECTION CONFIRMED", JSON.stringify({ time: new Date().toISOString(), symbol, direction, positionId: positionIdOf(livePos), entryPrice, stopLossPrice: stopFromEntry, takeProfitPrice: takeFromEntry, protected: true, manualStopLoss: false }));
+
+  return { success: true, order, position: livePos, protected: true, entryPrice, stopLossPrice: stopFromEntry, takeProfitPrice: takeFromEntry, protection };
+}
+
+// ============================================================
+// TRADE MANAGER
+// ============================================================
+function profitableMovePct(direction, entryPrice, marketPrice) {
+  if (!(entryPrice > 0 && marketPrice > 0)) return -1;
+  return direction === "LONG" ? (marketPrice - entryPrice) / entryPrice : (entryPrice - marketPrice) / entryPrice;
+}
+
+function betterStop(direction, candidate, current, contract) {
+  const c = num(current), n = num(candidate);
+  if (n === null) return false;
+  if (c === null) return true;
+  const tick = num(contract?.priceUnit) || 0.01;
+  return direction === "LONG" ? n > c + tick / 2 : n < c - tick / 2;
+}
+
+function safeStopForMarket(direction, stop, marketPrice, contract) {
+  const tick = num(contract?.priceUnit) || 0.01;
+  const minGap = Math.max(tick, marketPrice * MIN_STOP_DISTANCE_PCT);
+  let s = num(stop);
+  if (direction === "LONG") s = Math.min(s, marketPrice - minGap);
+  else s = Math.max(s, marketPrice + minGap);
+  return roundPrice(s, contract);
+}
+
+async function changeProtectionStop(symbol, match, direction, newStop, take, contract) {
+  const orderId = stopOrderIdOf(match);
+  if (orderId === undefined || orderId === null) throw new Error("Active TP/SL order id is unavailable");
+  await mexc("POST", "/api/v1/private/stoporder/change_price", { orderId, stopLossPrice: newStop, takeProfitPrice: take }, true);
+  await new Promise(r => setTimeout(r, 500));
+  const tpsl = await getOpenTPSL(symbol);
+  const pid = match.positionId;
+  const verified = tpsl.find(x => String(x.positionId) === String(pid) && (!x.state || Number(x.state) === 1));
+  const ok = !!verified && samePrice(verified.stopLossPrice, newStop, contract) && samePrice(verified.takeProfitPrice, take, contract);
+  if (!ok) throw new Error("MEXC did not verify the updated TP/SL");
+  return verified;
+}
+
+async function managePosition(symbol, position) {
+  const vol = positionVolume(position);
+  if (vol <= 0) return { symbol, skipped: true, reason: "zero position volume" };
+  const direction = positionDirection(position);
+  const entry = entryPriceOf(position);
+  if (!direction || !(entry > 0)) return { symbol, skipped: true, reason: "position direction or entry price unavailable" };
+
+  const [contract, ticker] = await Promise.all([getContract(symbol), getTicker(symbol)]);
+  const marketPrice = num(ticker?.lastPrice ?? ticker?.fairPrice ?? ticker?.indexPrice);
+  if (!(marketPrice > 0)) throw new Error("Current market price unavailable");
+
+  let tpsl = await getOpenTPSL(symbol);
+  let match = tpsl.find(x => String(x.positionId) === String(positionIdOf(position)) && (!x.state || Number(x.state) === 1) && (!Number.isFinite(Number(x.isFinished)) || Number(x.isFinished) === 0));
+
+  if (!match || num(match.takeProfitPrice) === null || num(match.stopLossPrice) === null) {
+    const target = protectionPricesFor(direction, entry, contract, null, null);
+    if (!target.valid || !(target.stop > 0) || !(target.take > 0)) {
+      return { symbol, direction, positionId: positionIdOf(position), entryPrice: entry, marketPrice, action: "PROTECTION_PLAN_REJECTED", reason: target.reason || "invalid automatic protection plan", stopLossPrice: target.stop ?? null, takeProfitPrice: target.take ?? null, manualStopLoss: false };
+    }
+    const protection = await ensureProtection(symbol, direction, position, target.stop, target.take, contract, entry);
+    if (!protection.protected) {
+      return { symbol, direction, positionId: positionIdOf(position), entryPrice: entry, marketPrice, action: "PROTECTION_VERIFICATION_PENDING", reason: "TP/SL accepted/settling; automatic structure SL is verifying", stopLossPrice: target.stop, takeProfitPrice: target.take, manualStopLoss: false };
+    }
+    match = protection.tpsl;
+  }
+
+  let currentTake = num(match?.takeProfitPrice);
+  let currentStop = num(match?.stopLossPrice);
+  if (!(currentTake > 0) || !(currentStop > 0)) {
+    return { symbol, direction, positionId: positionIdOf(position), entryPrice: entry, marketPrice, action: "PROTECTION_MISSING", reason: "verified TP/SL price unavailable", stopLossPrice: currentStop, takeProfitPrice: currentTake };
+  }
+
+  const profitPct = profitableMovePct(direction, entry, marketPrice);
+  let adaptive = null, tpUpdated = false, stopUpdated = false, newStop = currentStop;
+
+  try {
+    const [candles4h, candles1h, candles15m] = await Promise.all([getCandles(symbol, "Hour4"), getCandles(symbol, "Min60"), getCandles(symbol, "Min15")]);
+    const a4h = timeframeAnalysis(candles4h), a1h = timeframeAnalysis(candles1h), a15 = timeframeAnalysis(candles15m);
+    const combinedAnalysis = {
+      direction: a4h.direction === direction && (a1h.direction === direction || a1h.direction === "NEUTRAL") ? direction : "NEUTRAL",
+      momentumSlope: direction === "LONG" ? Math.max(Number(a4h.momentumSlope || 0), Number(a1h.momentumSlope || 0), Number(a15.momentumSlope || 0)) : Math.min(Number(a4h.momentumSlope || 0), Number(a1h.momentumSlope || 0), Number(a15.momentumSlope || 0)),
+      adx14: Math.max(Number(a4h.adx14 || 0), Number(a1h.adx14 || 0)),
+      rsi14: a15.rsi14 ?? a1h.rsi14 ?? a4h.rsi14,
+      higherTimeframeAligned: a4h.direction === direction && (a1h.direction === direction || a1h.direction === "NEUTRAL") && (a15.direction === direction || a15.direction === "NEUTRAL")
+    };
+    adaptive = adaptiveTpLevel(direction, entry, currentTake, marketPrice, combinedAnalysis);
+    if (adaptive) {
+      const targetTake = direction === "LONG" ? roundPrice(entry * (1 + adaptive.targetPct), contract) : roundPrice(entry * (1 - adaptive.targetPct), contract);
+      const currentPct = Math.abs((currentTake - entry) / entry);
+      if (targetTake > 0 && Math.abs(targetTake - currentTake) > (num(contract?.priceUnit) || 0.00000001) && adaptive.targetPct > currentPct + 0.0025) {
+        const orderId = stopOrderIdOf(match);
+        if (orderId !== undefined && orderId !== null) {
+          await mexc("POST", "/api/v1/private/stoporder/change_price", { orderId, takeProfitPrice: targetTake, stopLossPrice: currentStop }, true);
+          await new Promise(r => setTimeout(r, 500));
+          const verifiedRows = await getOpenTPSL(symbol);
+          const verified = verifiedRows.find(x => String(x.positionId ?? "") === String(positionIdOf(position)) && (!x.state || Number(x.state) === 1));
+          if (verified && num(verified.takeProfitPrice) !== null && num(verified.stopLossPrice) !== null && samePrice(verified.takeProfitPrice, targetTake, contract, 2)) {
+            match = verified;
+            currentTake = num(verified.takeProfitPrice);
+            currentStop = num(verified.stopLossPrice);
+            tpUpdated = true;
+            console.log("ADAPTIVE TP UPDATED", JSON.stringify({ symbol, direction, positionId: positionIdOf(position), entryPrice: entry, marketPrice, oldTake: currentTake, targetTake, targetPct: adaptive.targetPct, profitPct: adaptive.profitPct, momentumSlope: adaptive.momentumSlope, adx14: adaptive.adx14, rsi14: adaptive.rsi14 }));
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.log("ADAPTIVE TP CHECK ERROR", JSON.stringify({ symbol, direction, positionId: positionIdOf(position), error: e.message }));
+  }
+
+  try {
+    let candidateStop = null;
+    if (TRAILING_STOP_ENABLED && profitPct >= TRAILING_TRIGGER_PCT) {
+      candidateStop = direction === "LONG" ? marketPrice * (1 - TRAILING_STOP_PCT) : marketPrice * (1 + TRAILING_STOP_PCT);
+    } else if (BREAK_EVEN_ENABLED && profitPct >= BREAK_EVEN_TRIGGER_PCT) {
+      candidateStop = direction === "LONG" ? entry * (1 + BREAK_EVEN_OFFSET_PCT) : entry * (1 - BREAK_EVEN_OFFSET_PCT);
+    }
+
+    if (candidateStop !== null) {
+      candidateStop = safeStopForMarket(direction, candidateStop, marketPrice, contract);
+      if (betterStop(direction, candidateStop, currentStop, contract)) {
+        const updated = await changeProtectionStop(symbol, match, direction, candidateStop, currentTake, contract);
+        currentStop = num(updated?.stopLossPrice) ?? candidateStop;
+        match = updated;
+        stopUpdated = true;
+        newStop = currentStop;
+        console.log("PROFIT STOP UPDATED", JSON.stringify({ symbol, direction, positionId: positionIdOf(position), entryPrice: entry, marketPrice, profitPct, candidateStop: currentStop, mode: profitPct >= TRAILING_TRIGGER_PCT ? "TRAILING" : "BREAK_EVEN" }));
+      }
+    }
+  } catch (e) {
+    console.log("PROFIT STOP UPDATE ERROR", JSON.stringify({ symbol, direction, positionId: positionIdOf(position), error: e.message }));
+  }
+
+  return {
+    symbol, direction, positionId: positionIdOf(position), entryPrice: entry, marketPrice,
+    profitPct, stopLossPrice: currentStop, takeProfitPrice: currentTake,
+    action: tpUpdated ? "ADAPTIVE_TP_RAISED" : (stopUpdated ? "PROFIT_STOP_RAISED" : "HOLD_PROTECTED"),
+    reason: tpUpdated ? "Strong 4H/1H/15m trend; TP extended" : (stopUpdated ? "Profit protected with break-even/trailing stop" : "Automatic structure SL active"),
+    adaptiveTpEnabled: ADAPTIVE_TP_ENABLED, adaptiveTpMaxPct: ADAPTIVE_TP_MAX_PCT,
+    breakEvenEnabled: BREAK_EVEN_ENABLED, trailingStopEnabled: TRAILING_STOP_ENABLED,
+    manualStopLoss: false, tpsl: match
+  };
+}
+
+async function syncClosedRiskFromHistory() {
+  resetDailyRiskState();
+  let rows = [];
+  try {
+    const d = await mexc("GET", "/api/v1/private/position/list/history_positions", { start_time: Date.now() - 48 * 60 * 60 * 1000, end_time: Date.now(), page_num: 1, page_size: 100 }, true);
+    const payload = d?.data;
+    rows = Array.isArray(payload) ? payload : (Array.isArray(payload?.resultList) ? payload.resultList : []);
+  } catch { return; }
+  const closed = rows.filter(p => Number(p?.state) === 3 || Number(p?.closeVol || 0) > 0 || Number(p?.closeAvgPrice || 0) > 0)
+    .sort((a, b) => Number(a?.updateTime || a?.closeTime || 0) - Number(b?.updateTime || b?.closeTime || 0));
+  if (!tradeRiskState.seeded) {
+    for (const p of closed.slice(-100)) {
+      const id = String(p?.positionId || p?.id || "");
+      if (id) tradeRiskState.countedClosedPositions[id] = true;
+    }
+    tradeRiskState.seeded = true;
+    savePersistentState();
+    return;
+  }
+  let changed = false;
+  for (const p of closed) {
+    const id = String(p?.positionId || p?.id || "");
+    if (!id || tradeRiskState.countedClosedPositions[id]) continue;
+    const pnl = num(p?.realised ?? p?.realizedPnl ?? p?.profit);
+    if (pnl === null) continue;
+    tradeRiskState.countedClosedPositions[id] = true;
+    if (pnl < 0) recordLoss(); else if (pnl > 0) recordWin();
+    changed = true;
+  }
+  const ids = Object.keys(tradeRiskState.countedClosedPositions || {});
+  if (ids.length > 200) tradeRiskState.countedClosedPositions = Object.fromEntries(ids.slice(-200).map(id => [id, true]));
+  if (changed) savePersistentState();
+}
+
+async function tradeManagerOnce() {
+  if (tradeManagerBusy) return { skipped: true, reason: "trade manager already running" };
+  tradeManagerBusy = true;
+  lastTradeManagerRun = new Date().toISOString();
+  try {
+    if (!TRADE_MANAGER_ENABLED) { const r = { skipped: true, reason: "TRADE_MANAGER_ENABLED is false" }; lastTradeManagerResult = r; return r; }
+    if (!REAL_TRADING_ENABLED) { const r = { skipped: true, reason: "REAL_TRADING_ENABLED is false" }; lastTradeManagerResult = r; return r; }
+
+    await syncClosedRiskFromHistory();
+    const results = [];
+    const allPositions = await getPositions();
+    const grouped = new Map();
+    for (const position of allPositions) {
+      if (positionVolume(position) <= 0) continue;
+      const symbol = String(position?.symbol || "").toUpperCase();
+      if (!symbol) continue;
+      if (!grouped.has(symbol)) grouped.set(symbol, []);
+      grouped.get(symbol).push(position);
+    }
+    for (const [symbol, positions] of grouped.entries()) {
+      for (const position of positions) {
+        try { results.push(await managePosition(symbol, position)); }
+        catch (e) { results.push({ symbol, action: "MANAGER_ERROR", error: e.message }); }
+      }
+    }
+    const result = { success: true, results };
+    lastTradeManagerResult = result;
+    return result;
+  } finally {
+    tradeManagerBusy = false;
+  }
+}
+
+function resetDailyRiskState() {
+  loadPersistentState();
+  const day = localDayKey();
+  if (tradeRiskState.day !== day) {
+    tradeRiskState = { day, tradesToday: 0, lastEntryAt: 0, lossStreak: 0, lastClosedAt: 0, lastObservedPositions: {}, countedClosedPositions: {}, startEquity: null, seeded: false, lastEntryAudit: tradeRiskState.lastEntryAudit || null };
+    savePersistentState();
+  }
+  return tradeRiskState;
+}
+
+async function entryRiskGate(symbol, signal) {
+  resetDailyRiskState();
+  const direction = String(signal || "").toUpperCase();
+  if (!["LONG", "SHORT"].includes(direction)) return { ok: false, reason: `Invalid entry direction (${direction || "EMPTY"})` };
+  if (tradeRiskState.tradesToday >= MAX_TRADES_PER_DAY) return { ok: false, reason: `Daily trade limit reached (${MAX_TRADES_PER_DAY})` };
+  if (tradeRiskState.lossStreak >= MAX_LOSS_STREAK) { tradeRiskState.lossStreak = 0; savePersistentState(); }
+
+  const openPositions = await getPositions();
+  const open = openPositions.length;
+  const sameDirection = openPositions.filter(p => positionDirection(p) === direction).length;
+  if (POSITION_LIMIT_ENABLED && open >= MAX_OPEN_POSITIONS) return { ok: false, reason: `Maximum open positions reached (${MAX_OPEN_POSITIONS})` };
+  if (POSITION_LIMIT_ENABLED && sameDirection >= MAX_SAME_DIRECTION_POSITIONS) return { ok: false, reason: `Same-direction concentration limit reached (${MAX_SAME_DIRECTION_POSITIONS} ${direction})` };
+
+  const account = await getAccount();
+  const equity = accountEquity(account);
+  if (equity > 0 && !tradeRiskState.startEquity) { tradeRiskState.startEquity = equity; savePersistentState(); }
+
+  const news = await refreshNewsRisk();
+  const sig = await getSignal(symbol);
+  if (NEWS_RISK_ENABLED && (news?.blocked || sig?.newsRisk?.coinCritical)) return { ok: false, reason: sig?.reason || "News risk filter blocked entry" };
+
+  const stats = marketStatsCache.stats[symbol] || {};
+  if (LIQUIDITY_MIN_24H_USDT > 0 && stats.amount24 > 0 && stats.amount24 < LIQUIDITY_MIN_24H_USDT) return { ok: false, reason: `Liquidity filter: 24h turnover too low (${Math.round(stats.amount24)} USDT)` };
+  if (stats.bid1 > 0 && stats.ask1 > 0 && stats.lastPrice > 0) {
+    const spread = (stats.ask1 - stats.bid1) / stats.lastPrice;
+    if (spread > MAX_SPREAD_PCT) return { ok: false, reason: `Spread filter: ${(spread * 100).toFixed(3)}%` };
+  }
+
+  const atrPct = (sig?.atr14 && sig?.price) ? sig.atr14 / sig.price : 0;
+  if (atrPct > 0.08) return { ok: false, reason: `Extreme volatility filter (ATR ${(atrPct * 100).toFixed(2)}%)` };
+  if (sig?.quality?.volatilitySpike) return { ok: false, reason: `Volatility spike filter (${VOLATILITY_SPIKE_ATR_MULTIPLIER}x ATR)` };
+  if (Number(sig?.breakout?.extensionAtr || 0) > 2.75) return { ok: false, reason: sig.reason || "Extreme late entry extension" };
+  if (!MANUAL_STOP_LOSS && Number(sig?.quality?.riskReward || 0) < MIN_RISK_REWARD) return { ok: false, reason: `Risk/reward below minimum (${Number(sig?.quality?.riskReward || 0).toFixed(2)} < ${MIN_RISK_REWARD})` };
+  return { ok: true, openPositions: open, sameDirectionPositions: sameDirection, equity, signal };
+}
+
+// ============================================================
+// SCANNER
+// ============================================================
+async function mapWithConcurrency(items, limit, worker) {
+  const out = new Array(items.length);
+  let next = 0;
+  async function runner() {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      try { out[i] = await worker(items[i], i); }
+      catch (e) { out[i] = { error: e?.message || String(e) }; }
+    }
+  }
+  const n = Math.min(Math.max(1, limit), items.length || 1);
+  await Promise.all(Array.from({ length: n }, () => runner()));
+  return out;
+}
+
+function breakoutOpportunityFromCandles(candles) {
+  if (!Array.isArray(candles) || candles.length < BREAKOUT_LOOKBACK + BREAKOUT_RETEST_LOOKBACK_5M + 8) return null;
+  const closed = candles.slice(0, -1);
+  const current = closed[closed.length - 1];
+  const atr14 = atr(closed, 14);
+  if (!current || !(atr14 > 0)) return null;
+
+  const evaluateRetest = (direction, breakoutCandle, prior, level) => {
+    if (!breakoutCandle || !prior?.length || !(level > 0)) return null;
+    const bq = candleQuality(breakoutCandle);
+    const cq = candleQuality(current);
+    const range = Math.max(1e-12, Number(current.high) - Number(current.low));
+    const avgVol = averageVolume(prior, Math.min(20, prior.length));
+    const volumeRatio = avgVol > 0 ? (Number(breakoutCandle.volume) || 0) / avgVol : 0;
+    const breakoutBody = Math.abs(Number(breakoutCandle.close) - Number(breakoutCandle.open));
+    const breakoutBodyAtr = atr14 > 0 ? breakoutBody / atr14 : 0;
+    const reclaimBuffer = Math.max(BREAKOUT_RETEST_TOLERANCE_PCT * 0.20, ENTRY_PULLBACK_RECLAIM_BUFFER_PCT);
+    const touchTol = BREAKOUT_RETEST_TOLERANCE_PCT;
+
+    let touched = false, retestExtreme = null;
+    if (direction === "LONG") { touched = Number(current.low) <= level * (1 + touchTol); retestExtreme = Number(current.low); }
+    else { touched = Number(current.high) >= level * (1 - touchTol); retestExtreme = Number(current.high); }
+    const reclaimPass = direction === "LONG"
+      ? Boolean(cq.bullish) && Number(current.close) > level * (1 + reclaimBuffer)
+      : Boolean(cq.bearish) && Number(current.close) < level * (1 - reclaimBuffer);
+
+    const closeLocation = direction === "LONG"
+      ? (Number(current.close) - Number(current.low)) / range
+      : (Number(current.high) - Number(current.close)) / range;
+    const retestBodyPass = cq.bodyPct >= Math.max(ENTRY_TRIGGER_MIN_BODY_PCT, 0.30);
+    const retestClosePass = closeLocation >= Math.max(BREAKOUT_CLOSE_LOCATION_MIN, 0.70);
+    const volumePass = !BREAKOUT_REQUIRE_VOLUME || volumeRatio >= BREAKOUT_VOLUME_MULTIPLIER;
+    const breakoutBodyPass = breakoutBodyAtr >= BREAKOUT_MIN_BODY_ATR && bq.bodyPct >= BREAKOUT_MIN_BODY_RATIO;
+    if (!volumePass || !breakoutBodyPass) return null;
+
+    const retestPass = touched && reclaimPass && retestBodyPass && retestClosePass;
+    const continuationPass = !REQUIRE_BREAKOUT_RETEST && !retestPass &&
+      ((direction === "LONG" && Boolean(cq.bullish) && Number(current.close) > level * (1 + reclaimBuffer)) ||
+       (direction === "SHORT" && Boolean(cq.bearish) && Number(current.close) < level * (1 - reclaimBuffer))) &&
+      cq.bodyPct >= Math.max(ENTRY_TRIGGER_MIN_BODY_PCT, 0.20) &&
+      closeLocation >= Math.max(0.60, BREAKOUT_CLOSE_LOCATION_MIN - 0.10);
+    if (!retestPass && !continuationPass) return null;
+
+    const swingWindow = closed.slice(Math.max(0, closed.length - 10), closed.length);
+    const swingLow = Math.min(...swingWindow.map(c => Number(c.low)));
+    const swingHigh = Math.max(...swingWindow.map(c => Number(c.high)));
+    const extensionAtr = direction === "LONG"
+      ? Math.max(0, (Number(current.close) - level) / atr14)
+      : Math.max(0, (level - Number(current.close)) / atr14);
+    if (extensionAtr > BREAKOUT_MAX_EXTENSION_ATR) return null;
+
+    let score = retestPass ? 40 : 38;
+    if (volumeRatio >= BREAKOUT_VOLUME_MULTIPLIER) score += 15;
+    if (volumeRatio >= BREAKOUT_VOLUME_MULTIPLIER * 1.35) score += 5;
+    if (breakoutBodyAtr >= BREAKOUT_MIN_BODY_ATR) score += 10;
+    if (bq.bodyPct >= 0.60) score += 5;
+    if (closeLocation >= 0.85) score += 10;
+    if (cq.bodyPct >= 0.50) score += 5;
+    if (extensionAtr <= BREAKOUT_MAX_EXTENSION_ATR * 0.50) score += 10;
+    score = Math.min(100, score);
+
+    const counterWickPct = direction === "LONG" ? cq.upperWickPct : cq.lowerWickPct;
+    let precisionScore = score;
+    if (counterWickPct <= 0.20) precisionScore += 7;
+    else if (counterWickPct <= 0.30) precisionScore += 3;
+    else if (counterWickPct >= 0.45) precisionScore -= 7;
+    precisionScore = Math.max(0, Math.min(100, precisionScore));
+
+    return {
+      signal: score >= BREAKOUT_MIN_SCORE ? direction : "WAIT",
+      direction, score, precisionScore,
+      price: Number(current.close), atr: atr14, volumeRatio, rawVolumeRatio: volumeRatio,
+      breakoutLevel: level,
+      breakoutDistancePct: direction === "LONG" ? (Number(breakoutCandle.close) - level) / level : (level - Number(breakoutCandle.close)) / level,
+      extensionAtr, bodyAtr: breakoutBodyAtr, bodyPct: cq.bodyPct,
+      upperWickPct: cq.upperWickPct, lowerWickPct: cq.lowerWickPct, counterWickPct,
+      closeLocation, candleTime: current.time, breakoutCandleTime: breakoutCandle.time,
+      resistance: direction === "LONG" ? level : Math.max(...prior.map(c => Number(c.high))),
+      support: direction === "SHORT" ? level : Math.min(...prior.map(c => Number(c.low))),
+      swingLow, swingHigh,
+      pullbackLow: direction === "LONG" ? retestExtreme : null,
+      pullbackHigh: direction === "SHORT" ? retestExtreme : null,
+      confirmed: true, volumePass, bodyPass: breakoutBodyPass, directionSpecificPass: true,
+      early: false, retestConfirmed: retestPass, retestExtreme,
+      entryMode: retestPass ? "BREAKOUT_RETEST" : "BREAKOUT_CONTINUATION",
+      reason: retestPass
+        ? `${direction} confirmed 5m breakout → pullback/retest → reclaim`
+        : `${direction} confirmed closed 5m breakout continuation (retest not present)`,
+      pullbackEntryPass: retestPass
+    };
+  };
+
+  for (let barsAgo = 1; barsAgo <= BREAKOUT_RETEST_LOOKBACK_5M; barsAgo++) {
+    const idx = closed.length - 1 - barsAgo;
+    if (idx < BREAKOUT_LOOKBACK) continue;
+    const breakoutCandle = closed[idx];
+    const prior = closed.slice(idx - BREAKOUT_LOOKBACK, idx);
+    if (prior.length < BREAKOUT_LOOKBACK) continue;
+
+    const resistance = Math.max(...prior.map(c => Number(c.high)));
+    const support = Math.min(...prior.map(c => Number(c.low)));
+    const longBreak = Number(breakoutCandle.close) > resistance * (1 + BREAKOUT_BUFFER_PCT) && candleQuality(breakoutCandle).bullish;
+    const shortBreak = Number(breakoutCandle.close) < support * (1 - BREAKOUT_BUFFER_PCT) && candleQuality(breakoutCandle).bearish;
+
+    if (longBreak) { const r = evaluateRetest("LONG", breakoutCandle, prior, resistance); if (r?.signal === "LONG") return r; }
+    if (shortBreak) { const r = evaluateRetest("SHORT", breakoutCandle, prior, support); if (r?.signal === "SHORT") return r; }
+  }
+
+  return {
+    signal: "WAIT", direction: "WAIT", score: 0, precisionScore: 0,
+    price: Number(current.close), atr: atr14, volumeRatio: 0, rawVolumeRatio: 0,
+    breakoutLevel: null, breakoutDistancePct: 0, extensionAtr: 0, bodyAtr: 0,
+    bodyPct: 0, upperWickPct: 0, lowerWickPct: 0, counterWickPct: 0, closeLocation: 0,
+    candleTime: current.time, resistance: null, support: null, swingLow: null, swingHigh: null,
+    confirmed: false, volumePass: false, bodyPass: false, directionSpecificPass: false,
+    early: false, retestConfirmed: false,
+    reason: "No confirmed 5m breakout followed by a pullback/retest reclaim"
+  };
+}
+
+function fallbackMomentumOpportunity(candles) {
+  if (!Array.isArray(candles) || candles.length < 80) return null;
+  const closed = candles.slice(0, -1);
+  const current = closed[closed.length - 1];
+  const a = atr(closed, 14);
+  if (!current || !(a > 0)) return null;
+
+  const closes = closed.map(c => Number(c.close));
+  const e9s = ema(closes, 9);
+  const e21s = ema(closes, 21);
+  const e50s = ema(closes, 50);
+  const i = closed.length - 1;
+  const e9 = Number(e9s[i]);
+  const e21 = Number(e21s[i]);
+  const e50 = Number(e50s[i]);
+  if (![e9, e21, e50].every(Number.isFinite)) return null;
+
+  const q = candleQuality(current);
+  const range = Math.max(1e-12, Number(current.high) - Number(current.low));
+  const closeLong = (Number(current.close) - Number(current.low)) / range;
+  const closeShort = (Number(current.high) - Number(current.close)) / range;
+  const avgVol = averageVolume(closed.slice(-21, -1), 20);
+  const volumeRatio = avgVol > 0 ? (Number(current.volume) || 0) / avgVol : 0;
+  const bodyAtr = Math.abs(Number(current.close) - Number(current.open)) / a;
+  const distE21 = Math.abs(Number(current.close) - e21) / a;
+
+  if (distE21 > ENTRY_TRIGGER_MAX_DISTANCE_ATR) return null;
+  if (bodyAtr < 0.05 || volumeRatio < 0.40) return null;
+
+  const longTrend = Number(current.close) > e9 && e9 > e21 && e21 >= e50;
+  const shortTrend = Number(current.close) < e9 && e9 < e21 && e21 <= e50;
+  const longPass = longTrend && Boolean(q.bullish) && q.bodyPct >= Math.max(ENTRY_TRIGGER_MIN_BODY_PCT, 0.10) && closeLong >= 0.50;
+  const shortPass = shortTrend && Boolean(q.bearish) && q.bodyPct >= Math.max(ENTRY_TRIGGER_MIN_BODY_PCT, 0.10) && closeShort >= 0.50;
+  if (!longPass && !shortPass) return null;
+
+  const direction = longPass ? 'LONG' : 'SHORT';
+  const closeLocation = direction === 'LONG' ? closeLong : closeShort;
+  let score = 60;
+  if (volumeRatio >= 0.75) score += 4;
+  if (volumeRatio >= 1.00) score += 6;
+  if (volumeRatio >= 1.30) score += 5;
+  if (bodyAtr >= 0.12) score += 3;
+  if (bodyAtr >= 0.25) score += 5;
+  if (closeLocation >= 0.60) score += 3;
+  if (closeLocation >= 0.70) score += 4;
+  if (distE21 <= 0.75) score += 3;
+  if (e9 > e21 && e21 > e50 && direction === 'LONG') score += 3;
+  if (e9 < e21 && e21 < e50 && direction === 'SHORT') score += 3;
+  score = Math.min(95, score);
+
+  const recent = closed.slice(Math.max(0, closed.length - 12), closed.length);
+  const breakoutLevel = direction === 'LONG' ? Math.max(...recent.slice(0, -1).map(c => Number(c.high))) : Math.min(...recent.slice(0, -1).map(c => Number(c.low)));
+  const swingLow = Math.min(...recent.map(c => Number(c.low)));
+  const swingHigh = Math.max(...recent.map(c => Number(c.high)));
+
+  return {
+    signal: direction, direction, score, precisionScore: score,
+    price: Number(current.close), atr: a, volumeRatio, rawVolumeRatio: volumeRatio,
+    breakoutLevel, breakoutDistancePct: 0, extensionAtr: distE21, bodyAtr,
+    bodyPct: q.bodyPct, upperWickPct: q.upperWickPct, lowerWickPct: q.lowerWickPct,
+    counterWickPct: direction === 'LONG' ? q.upperWickPct : q.lowerWickPct,
+    closeLocation, candleTime: current.time, breakoutCandleTime: current.time,
+    resistance: swingHigh, support: swingLow, swingLow, swingHigh,
+    confirmed: true, volumePass: true, bodyPass: true, directionSpecificPass: true,
+    early: false, retestConfirmed: false, pullbackEntryPass: false,
+    fallbackMomentum: true, pullbackType: null, pullbackDepthAtr: 0, pullbackBarsAgo: null,
+    entryMode: '5M_TREND_MOMENTUM_NO_PULLBACK',
+    reason: `${direction} 5m closed trend-momentum confirmation; pullback/retest not required`
+  };
+}
+
+function fastOpportunityScore(candles) {
+  const breakout = breakoutOpportunityFromCandles(candles);
+  const b = (breakout && breakout.signal !== "WAIT") ? breakout : fallbackMomentumOpportunity(candles);
+  if (!b) return null;
+  const safePrecisionScore = Number.isFinite(Number(b.precisionScore))
+    ? Math.max(0, Math.min(100, Number(b.precisionScore)))
+    : Math.max(0, Math.min(100, Number(b.score) || 0));
+  return {
+    direction: b.signal, score: b.score, precisionScore: safePrecisionScore,
+    price: b.price, atr: b.atr, volumeRatio: b.volumeRatio,
+    breakoutLevel: b.breakoutLevel, breakoutDistancePct: b.breakoutDistancePct,
+    extensionAtr: b.extensionAtr, bodyAtr: b.bodyAtr, closeLocation: b.closeLocation,
+    candleTime: b.candleTime, confirmed: b.confirmed, reason: b.reason
+  };
+}
+
+async function getFastCandles(symbol) {
+  const key = `${symbol}:FAST5`;
+  const ttl = 15 * 1000;
+  const cached = candleCache.get(key);
+  if (cached && Date.now() - cached.time < ttl) return cached.data;
+  const end = Date.now();
+  const bars = 140;
+  const start = end - (bars + 5) * 5 * 60 * 1000;
+  const data = await mexc("GET", "/api/v1/contract/kline/" + symbol, { interval: "Min5", start: Math.floor(start / 1000), end: Math.floor(end / 1000) });
+  const candles = normalizeCandles(data).sort((a, b) => a.time - b.time);
+  candleCache.set(key, { time: Date.now(), data: candles });
+  return candles;
+}
+
+async function getEntryScanCandles(symbol) {
+  const key = `${symbol}:ENTRY15`;
+  const ttl = 20 * 1000;
+  const cached = candleCache.get(key);
+  if (cached && Date.now() - cached.time < ttl) return cached.data;
+  const end = Date.now();
+  const bars = 140;
+  const start = end - (bars + 5) * 15 * 60 * 1000;
+  const data = await mexc("GET", "/api/v1/contract/kline/" + symbol, { interval: "Min15", start: Math.floor(start / 1000), end: Math.floor(end / 1000) });
+  const candles = normalizeCandles(data).sort((a, b) => a.time - b.time);
+  candleCache.set(key, { time: Date.now(), data: candles });
+  return candles;
+}
+
+async function fullUniverseFastScan(symbols) {
+  const rows = await mapWithConcurrency(symbols, FAST_SCAN_CONCURRENCY, async symbol => {
+    const candles = await getEntryScanCandles(symbol);
+    const fast = fastOpportunityScore(candles);
+    if (!fast) return { symbol, signal: "WAIT", score: 0, reason: "insufficient 15m data" };
+    return { symbol, signal: fast.direction, score: fast.score, fast };
+  });
+  return rows.filter(Boolean);
+}
+
+async function selectDeepCandidates(symbols) {
+  const fastRows = await fullUniverseFastScan(symbols);
+  const errors = fastRows.filter(x => x?.error);
+  const ranked = fastRows
+    .filter(x => !x?.error && x.signal !== "WAIT" && Number.isFinite(Number(x.score)) && Number(x.score) >= 45)
+    .sort((a, b) => Number(b.score) - Number(a.score));
+  const top = ranked.slice(0, DEEP_SCAN_CANDIDATES);
+  return { fastRows, top, errorCount: errors.length, errorSamples: errors.slice(0, 5).map(x => x.error) };
+}
+
+async function selectScanSymbols() {
+  const universe = await refreshActiveSymbols();
+  const list = Array.isArray(universe) && universe.length ? universe : CORE_SYMBOLS;
+  if (list.length <= SCAN_BATCH_SIZE) {
+    scanCycle += 1;
+    return list;
+  }
+  const start = scanCursor % list.length;
+  const batch = [];
+  for (let i = 0; i < SCAN_BATCH_SIZE; i++) batch.push(list[(start + i) % list.length]);
+  scanCursor = (start + SCAN_BATCH_SIZE) % list.length;
+  scanCycle += 1;
+  return batch;
+}
+
+async function autoTradeOnce() {
+  if (autoBusy) {
+    const age = autoBusySince ? (Date.now() - autoBusySince) : 0;
+    if (age > AUTO_RUN_STALE_MS) {
+      console.log(`AUTO WATCHDOG: stale run lock cleared after ${Math.round(age / 60000)}m`);
+      autoBusy = false; autoBusySince = 0;
+    } else {
+      return { skipped: true, reason: "auto run already in progress", busyAgeMs: age };
+    }
+  }
+  autoBusy = true;
+  autoBusySince = Date.now();
+  lastAutoRun = new Date().toISOString();
+
+  try {
+    const management = await tradeManagerOnce();
+
+    if (!AUTO_TRADING_ENABLED) return { skipped: true, reason: "AUTO_TRADING_ENABLED is false", management };
+    if (!REAL_TRADING_ENABLED) return { skipped: true, reason: "REAL_TRADING_ENABLED is false", management };
+
+    const managementBlocked = Array.isArray(management?.results) && management.results.some(r => r?.critical || r?.emergencyClose || r?.action === "MANAGER_ERROR" || r?.action === "MANAGEMENT_ERROR");
+    if (managementBlocked) return { skipped: true, reason: "Trade manager protection error; new entry blocked", management };
+
+    const currentPositions = (await getPositions()).filter(p => positionVolume(p) > 0).map(p => ({
+      symbol: p?.symbol || null, positionId: positionIdOf(p), direction: positionDirection(p),
+      entryPrice: num(p?.openAvgPrice ?? p?.openAvgPx ?? p?.avgPrice ?? p?.entryPrice), volume: positionVolume(p)
+    }));
+    const open = currentPositions.length;
+    if (POSITION_LIMIT_ENABLED && open >= MAX_OPEN_POSITIONS) {
+      return { skipped: true, reason: `Maximum open positions reached (${MAX_OPEN_POSITIONS})`, management, currentPositions, lastSuccessfulEntry: lastSuccessfulEntry || tradeRiskState.lastEntryAudit || null };
+    }
+
+    const symbols = await selectScanSymbols();
+    const checked = [];
+    const fastScan = await selectDeepCandidates(symbols);
+    const candidates = [];
+    const signalCacheForCycle = new Map();
+
+    const deepRows = await mapWithConcurrency(fastScan.top, 6, async item => {
+      const sig = await getAdvancedSignal(item.symbol);
+      signalCacheForCycle.set(item.symbol, sig);
+      return { item, sig };
+    });
+    for (const row of deepRows) {
+      if (!row || row.error) {
+        checked.push({ symbol: row?.item?.symbol || null, error: row?.error || "deep scan failed" });
+        continue;
+      }
+      const { item, sig } = row;
+      checked.push({ symbol: item.symbol, signal: sig?.signal, score: sig?.score ?? item.score, reason: sig?.reason ?? null, candleTime: sig?.candleTime, fastScore: item.score });
+      if (sig?.signal !== "WAIT") candidates.push({
+        symbol: item.symbol, signal: sig.signal, score: sig.score || 0,
+        precisionScore: sig.precisionScore ?? sig.score ?? 0, candleTime: sig.candleTime,
+        fastScore: item.score, fastPrecisionScore: item.precisionScore ?? item.score
+      });
+    }
+    candidates.sort((a, b) => Number(b.precisionScore) - Number(a.precisionScore) || Number(b.score) - Number(a.score));
+
+    if (checked.length > 80) checked.length = 80;
+
+    const nearCandidates = checked
+      .filter(x => Number.isFinite(Number(x.score)) && Number(x.score) > 0)
+      .sort((a, b) => (Number(b.score) - Number(a.score)))
+      .slice(0, 5);
+
+    const top3Diagnostic = nearCandidates.slice(0, 3).map(row => {
+      const sig = signalCacheForCycle.get(row.symbol);
+      const q = sig?.quality || {};
+      const direction = sig?.signal === "LONG" || sig?.signal === "SHORT"
+        ? sig.signal
+        : (sig?.directionScores?.LONG >= sig?.directionScores?.SHORT ? "LONG" : "SHORT");
+      const b = sig?.breakout || {};
+      return {
+        symbol: row.symbol, signal: sig?.signal || row.signal, score: sig?.score ?? row.score,
+        precisionScore: sig?.precisionScore ?? row.precisionScore ?? row.score,
+        direction, reason: sig?.reason || row.reason, candleTime: sig?.candleTime,
+        checks: {
+          breakoutOnly: Boolean(q.breakoutOnly),
+          momentumFallback: Boolean(sig?.breakout?.fallbackMomentum || sig?.fallbackMomentum),
+          breakoutConfirmed: Boolean(q.breakoutConfirmed),
+          breakoutVolumePass: Boolean(q.breakoutVolumePass),
+          breakoutBodyPass: Boolean(q.breakoutBodyPass),
+          breakoutExtensionPass: Boolean(q.breakoutExtensionPass),
+          scoreMin: Number(sig?.score || 0) >= BREAKOUT_MIN_SCORE,
+          strictTriggerPass: Boolean(q.strictTriggerPass),
+          lateEntryRisk: !Boolean(q.lateEntryRisk),
+          riskRewardOk: Number(q.riskReward || 0) >= Number(q.minRiskReward || MIN_RISK_REWARD),
+          stopDistanceOk: Boolean(q.stopDistanceOk),
+          volatilityOk: !Boolean(q.volatilitySpike),
+          newsOk: !(sig?.newsRisk?.marketBlocked || sig?.newsRisk?.coinCritical)
+        },
+        values: {
+          breakoutLevel: b.level ?? null, breakoutDistancePct: b.distancePct ?? null,
+          breakoutExtensionAtr: b.extensionAtr ?? null, breakoutVolumeRatio: b.volumeRatio ?? null,
+          breakoutBodyAtr: b.bodyAtr ?? null, closeLocation: b.closeLocation ?? null,
+          lookback: b.lookback ?? BREAKOUT_LOOKBACK, riskReward: q.riskReward ?? 0,
+          minRiskReward: q.minRiskReward ?? MIN_RISK_REWARD
+        }
+      };
+    });
+
+    const preflightFailures = [];
+    for (const candidate of candidates.slice(0, MAX_PREFLIGHT_CANDIDATES)) {
+      try {
+        const pf = await preflight(candidate.symbol);
+        const signal = pf.signal;
+        if (!pf.ready) {
+          console.log("ENTRY PREFLIGHT BLOCK", JSON.stringify({
+            symbol: candidate.symbol, requestedSignal: candidate.signal, liveSignal: signal?.signal || null,
+            readyReason: pf.readyReason, balanceOk: pf.balanceOk, sizingOk: pf.sizingOk,
+            openTypeOk: pf.openTypeOk, actualOpenType: pf.actualOpenType,
+            leverageOk: pf.leverageOk, positionModeOk: pf.positionModeOk,
+            actualPositionMode: pf.actualPositionMode, noOpenPosition: pf.noOpenPosition,
+            noOpenOrders: pf.noOpenOrders, noPlanOrders: pf.noPlanOrders
+          }));
+        }
+        if (!pf.ready || signal?.signal !== candidate.signal) {
+          preflightFailures.push({
+            symbol: candidate.symbol, signal: candidate.signal, ready: pf.ready,
+            readyReason: pf.readyReason, liveSignal: signal?.signal || null,
+            balanceOk: pf.balanceOk, sizingOk: pf.sizingOk, leverageOk: pf.leverageOk,
+            openTypeOk: pf.openTypeOk, positionModeOk: pf.positionModeOk
+          });
+          const row = checked.find(x => x.symbol === candidate.symbol);
+          if (row) row.preflight = { ready: pf.ready, readyReason: pf.readyReason, liveSignal: signal?.signal || null };
+          continue;
+        }
+
+        const riskGate = await entryRiskGate(candidate.symbol, signal.signal);
+        if (!riskGate.ok) {
+          preflightFailures.push({ symbol: candidate.symbol, signal: candidate.signal, riskBlocked: riskGate.reason });
+          const row = checked.find(x => x.symbol === candidate.symbol);
+          if (row) row.riskBlocked = riskGate.reason;
+          continue;
+        }
+
+        const candleKey = `${candidate.symbol}:${signal.candleTime}:${signal.signal}`;
+        if (lastTradeSignalCandle.get(candidate.symbol) === candleKey) continue;
+
+        if (signal?.signal !== candidate.signal || !["LONG", "SHORT"].includes(signal?.signal)) {
+          const row = checked.find(x => x.symbol === candidate.symbol);
+          if (row) row.preflightError = "FINAL DIRECTION MISMATCH - ORDER BLOCKED";
+          continue;
+        }
+        const result = await placeMarketOrder(candidate.symbol, signal.signal);
+        if (result?.success) {
+          lastTradeSignalCandle.set(candidate.symbol, candleKey);
+          const entryAudit = {
+            time: new Date().toISOString(), symbol: candidate.symbol, direction: signal.signal,
+            signalCandleTime: signal.candleTime,
+            entryMode: signal?.quality?.entryMode || signal?.breakout?.entryMode || "UNKNOWN",
+            score: signal.score, precisionScore: signal.precisionScore, reason: signal.reason,
+            higherTimeframeConsensus: signal.higherTimeframeConsensus || null,
+            wickCheck: signal?.quality?.wickCheck || signal?.breakout?.wickCheck || null,
+            breakoutLevel: signal?.quality?.breakoutLevel ?? signal?.breakout?.breakoutLevel ?? null,
+            entryPrice: result.entryPrice ?? result.position?.openAvgPrice ?? null,
+            stopLossPrice: result.stopLossPrice ?? null, takeProfitPrice: result.takeProfitPrice ?? null,
+            protected: Boolean(result.protected)
+          };
+          lastSuccessfulEntry = entryAudit;
+          resetDailyRiskState();
+          tradeRiskState.tradesToday += 1;
+          tradeRiskState.lastEntryAt = Date.now();
+          tradeRiskState.lastEntryAudit = entryAudit;
+          savePersistentState();
+        }
+        return {
+          traded: true, symbol: candidate.symbol, direction: signal.signal,
+          entryAudit: lastSuccessfulEntry, candleTime: signal.candleTime, score: signal.score,
+          universeSymbols: ALLOWED_SYMBOLS.length, scanBatchSize: SCAN_BATCH_SIZE, scanCycle,
+          fastScannedSymbols: fastScan.fastRows.filter(x => !x?.error).length,
+          fastScanErrorCount: fastScan.errorCount || 0,
+          fastScanErrorSamples: fastScan.errorSamples || [],
+          deepScannedSymbols: fastScan.top.length,
+          fastTop3: fastScan.top.slice(0, 3),
+          checked, candidates: candidates.slice(0, 10), nearCandidates, top3Diagnostic,
+          management, result
+        };
+      } catch (e) {
+        const row = checked.find(x => x.symbol === candidate.symbol);
+        if (row) row.preflightError = e.message;
+      }
+    }
+
+    const topRows = candidates.slice(0, 5).map(c => checked.find(x => x.symbol === c.symbol) || c);
+    return {
+      skipped: true,
+      reason: candidates.length ? "Top 15m quality signals failed final preflight/risk gate" : "No quality 15m entry candidate passed the scanner",
+      preflightFailures: preflightFailures.slice(0, MAX_PREFLIGHT_CANDIDATES),
+      scannedSymbols: symbols.length, universeSymbols: ALLOWED_SYMBOLS.length,
+      scanBatchSize: SCAN_BATCH_SIZE, scanCycle,
+      scanCoveragePct: ALLOWED_SYMBOLS.length ? Math.round((symbols.length / ALLOWED_SYMBOLS.length) * 100) : 0,
+      fastScannedSymbols: fastScan.fastRows.filter(x => !x?.error).length,
+      fastScanErrorCount: fastScan.errorCount || 0,
+      fastScanErrorSamples: fastScan.errorSamples || [],
+      deepScannedSymbols: fastScan.top.length,
+      fastTop3: fastScan.top.slice(0, 3),
+      candidates: candidates.slice(0, 10), nearCandidates, topCandidateChecks: topRows,
+      top3Diagnostic, checked, currentPositions,
+      lastSuccessfulEntry: lastSuccessfulEntry || tradeRiskState.lastEntryAudit || null,
+      management
+    };
+  } catch (e) {
+    return { error: true, message: e.message };
+  } finally {
+    autoBusy = false;
+    autoBusySince = 0;
+  }
+}
+
+// ============================================================
+// HTTP ENDPOINTS
+// ============================================================
+app.get("/", (req, res) => res.json({
+  service: "mexc-futures-trading-bot",
+  version: BOT_VERSION,
+  symbol: SYMBOL,
+  realTradingEnabled: REAL_TRADING_ENABLED,
+  autoTradingEnabled: AUTO_TRADING_ENABLED
+}));
+
+app.get("/health", (req, res) => res.json({
+  success: true,
+  version: BOT_VERSION,
+  credentialsConfigured: !!(ACCESS_KEY && SECRET_KEY),
+  realTradingEnabled: REAL_TRADING_ENABLED,
+  autoTradingEnabled: AUTO_TRADING_ENABLED,
+  maxOrderUSDT: MAX_ORDER_USDT,
+  adaptiveOrderSize: ADAPTIVE_ORDER_SIZE,
+  orderBalanceReserveUSDT: ORDER_BALANCE_RESERVE_USDT,
+  minAdaptiveOrderUSDT: MIN_ADAPTIVE_ORDER_USDT,
+  targetLeverage: TARGET_LEVERAGE,
+  tradeManagerEnabled: TRADE_MANAGER_ENABLED,
+  tradeManagerIntervalSeconds: TRADE_MANAGER_INTERVAL_SECONDS,
+  allowedSymbolsCount: ALLOWED_SYMBOLS.length,
+  minSignalScore: MIN_SIGNAL_SCORE,
+  minScoreEdge: MIN_SCORE_EDGE,
+  scanSymbols: SCAN_SYMBOLS,
+  analysisTimeframes: ANALYSIS_TIMEFRAMES,
+  breakoutOnly: false,
+  positionMode: CONFIGURED_POSITION_MODE,
+  openType: CONFIGURED_OPEN_TYPE,
+  symbolLimit: SYMBOL_LIMIT,
+  tradingSymbols: CORE_SYMBOLS,
+  newsRiskEnabled: NEWS_RISK_ENABLED,
+  positionLimitEnabled: POSITION_LIMIT_ENABLED,
+  maxOpenPositions: MAX_OPEN_POSITIONS,
+  maxSameDirectionPositions: MAX_SAME_DIRECTION_POSITIONS,
+  maxPreflightCandidates: MAX_PREFLIGHT_CANDIDATES,
+  maxTradesPerDay: MAX_TRADES_PER_DAY,
+  liquidityMin24hUSDT: LIQUIDITY_MIN_24H_USDT,
+  maxSpreadPct: MAX_SPREAD_PCT,
+  mexcMinRequestGapMs: MEXC_MIN_REQUEST_GAP_MS,
+  mexcMaxRetries: MEXC_MAX_RETRIES,
+  candleCacheTtlsMs: CANDLE_CACHE_TTL_MS
+}));
+
+app.get("/api/signal", async (req, res) => {
+  try { res.json({ success: true, ...(await getSignal(req.query.symbol || SYMBOL)) }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get("/api/signals", async (req, res) => {
+  try {
+    await refreshActiveSymbols();
+    const results = [];
+    for (const symbol of ALLOWED_SYMBOLS) {
+      try { results.push(await getSignal(symbol)); }
+      catch (e) { results.push({ symbol, signal: "ERROR", error: e.message }); }
+    }
+    res.json({ success: true, interval: INTERVAL, symbols: ALLOWED_SYMBOLS, results });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/api/preflight", requireAdmin, async (req, res) => {
+  try { res.json(await preflight(req.query.symbol || SYMBOL)); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get("/api/preflight-all", requireAdmin, async (req, res) => {
+  try {
+    const requested = String(req.query.symbols || "").split(",").map(x => x.trim().toUpperCase()).filter(Boolean);
+    const parsedLimit = Number.parseInt(req.query.limit || "5", 10);
+    const limit = Number.isFinite(parsedLimit) ? Math.min(Math.max(parsedLimit, 1), 20) : 5;
+
+    let universe = ALLOWED_SYMBOLS;
+    if (requested.length) {
+      universe = requested.filter(symbol => ALLOWED_SYMBOLS.includes(symbol));
+      if (!universe.length) return res.status(400).json({ success: false, error: "No requested symbols are in ALLOWED_SYMBOLS", requested, allowedSymbolsCount: ALLOWED_SYMBOLS.length });
+    } else {
+      universe = ALLOWED_SYMBOLS.slice(0, limit);
+    }
+
+    const results = [];
+    for (const symbol of universe.slice(0, limit)) {
+      try { results.push(await preflight(symbol)); }
+      catch (e) { results.push({ success: false, symbol, error: e.message }); }
+    }
+    res.json({ success: true, checkedCount: results.length, availableSymbolsCount: ALLOWED_SYMBOLS.length, truncated: results.length < ALLOWED_SYMBOLS.length, results });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/api/order-preview", async (req, res) => {
+  try {
+    const symbol = String(req.query.symbol || SYMBOL).toUpperCase();
+    const pf = await preflight(symbol);
+    const signalObj = (pf.signal && typeof pf.signal === "object") ? pf.signal : null;
+    const direction = String(signalObj?.signal ?? pf.signal ?? "WAIT").toUpperCase();
+    const price = num(pf.price ?? signalObj?.price) || 0;
+    const contract = pf.contract || {};
+    const size = num(contract?.contractSize) || 0.1;
+    const volume = num(pf.volume) || 0;
+    const atr14 = num(signalObj?.atr14);
+
+    let stopLossPrice = null, takeProfitPrice = null, targetPlan = null;
+    if (price > 0 && (direction === "LONG" || direction === "SHORT")) {
+      targetPlan = protectionPricesFor(direction, price, contract, atr14);
+      stopLossPrice = targetPlan.stop;
+      takeProfitPrice = targetPlan.take;
+    }
+
+    const notional = price * size * volume;
+    const requiredMargin = notional / TARGET_LEVERAGE;
+
+    res.json({
+      success: true, symbol, liveTradingEnabled: REAL_TRADING_ENABLED,
+      autoTradingEnabled: AUTO_TRADING_ENABLED, direction,
+      reason: pf.signal?.reason || null, price, contractSize: size,
+      minVol: num(contract?.minVol) || 1, volume, notional, requiredMargin,
+      leverage: TARGET_LEVERAGE, marginMode: pf.isolatedMargin ? "ISOLATED" : "UNKNOWN",
+      stopLossPrice, takeProfitPrice,
+      stopLossPct: targetPlan?.stopPct ?? null,
+      takeProfitPct: targetPlan?.tpPct ?? TAKE_PROFIT_PCT,
+      riskReward: null,
+      protectionPlanReady: Boolean(targetPlan && takeProfitPrice),
+      manualStopLoss: MANUAL_STOP_LOSS, preflightReady: !!pf.ready, willPlaceOrder: false
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/api/account", requireAdmin, async (req, res) => {
+  try { res.json(await getAccount()); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get("/api/positions", requireAdmin, async (req, res) => {
+  try { res.json({ success: true, data: await getPositions(req.query.symbol || SYMBOL) }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get("/api/symbols", async (req, res) => {
+  await refreshActiveSymbols();
+  res.json({
+    success: true,
+    source: symbolUniverseCache.source,
+    updatedAt: symbolUniverseCache.time ? new Date(symbolUniverseCache.time).toISOString() : null,
+    symbols: ALLOWED_SYMBOLS,
+    removedFromCoreSymbols: symbolUniverseCache.removed
+  });
+});
+
+app.get("/api/news-risk", async (req, res) => {
+  try { res.json({ success: true, ...(await refreshNewsRisk(true)) }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get("/api/config", (req, res) => res.json({
+  success: true,
+  version: BOT_VERSION,
+  defaults: {
+    maxOrderUSDT: MAX_ORDER_USDT,
+    adaptiveOrderSize: ADAPTIVE_ORDER_SIZE,
+    orderBalanceReserveUSDT: ORDER_BALANCE_RESERVE_USDT,
+    minAdaptiveOrderUSDT: MIN_ADAPTIVE_ORDER_USDT,
+    targetLeverage: TARGET_LEVERAGE,
+    stopLossPct: STOP_LOSS_PCT,
+    takeProfitPct: TAKE_PROFIT_PCT,
+    adaptiveTpEnabled: ADAPTIVE_TP_ENABLED,
+    adaptiveTpStartPct: ADAPTIVE_TP_START_PCT,
+    adaptiveTpMaxPct: ADAPTIVE_TP_MAX_PCT,
+    adaptiveTpStepPct: ADAPTIVE_TP_STEP_PCT,
+    adaptiveTpExtendTriggerPct: ADAPTIVE_TP_EXTEND_TRIGGER_PCT,
+    targetFirstTpRangePct: { min: TARGET_FIRST_MIN_TP_PCT, max: TARGET_FIRST_MAX_TP_PCT },
+    targetFirstAtrMultiplier: TARGET_FIRST_ATR_MULT,
+    interval: INTERVAL,
+    autoIntervalMinutes: AUTO_INTERVAL_MINUTES,
+    tradeManagerEnabled: TRADE_MANAGER_ENABLED,
+    tradeManagerIntervalSeconds: TRADE_MANAGER_INTERVAL_SECONDS,
+    breakEvenEnabled: BREAK_EVEN_ENABLED,
+    breakEvenTriggerPct: BREAK_EVEN_TRIGGER_PCT,
+    breakEvenOffsetPct: BREAK_EVEN_OFFSET_PCT,
+    trailingStopEnabled: TRAILING_STOP_ENABLED,
+    trailingTriggerPct: TRAILING_TRIGGER_PCT,
+    trailingStopPct: TRAILING_STOP_PCT,
+    minStopDistancePct: MIN_STOP_DISTANCE_PCT,
+    minSignalScore: MIN_SIGNAL_SCORE,
+    minScoreEdge: MIN_SCORE_EDGE,
+    scanSymbols: SCAN_SYMBOLS,
+    analysisTimeframes: ANALYSIS_TIMEFRAMES,
+    breakoutOnly: false,
+    positionMode: CONFIGURED_POSITION_MODE,
+    openType: CONFIGURED_OPEN_TYPE,
+    volumeMultiplier: VOLUME_MULTIPLIER,
+    adxMin: ADX_MIN,
+    supportResistanceLookback: SR_LOOKBACK,
+    symbolLimit: SYMBOL_LIMIT,
+    tradingSymbols: CORE_SYMBOLS,
+    newsRiskEnabled: NEWS_RISK_ENABLED,
+    newsRiskLookbackMinutes: NEWS_RISK_LOOKBACK_MINUTES,
+    positionLimitEnabled: POSITION_LIMIT_ENABLED,
+    maxOpenPositions: MAX_OPEN_POSITIONS,
+    maxSameDirectionPositions: MAX_SAME_DIRECTION_POSITIONS,
+    maxPreflightCandidates: MAX_PREFLIGHT_CANDIDATES,
+    maxTradesPerDay: MAX_TRADES_PER_DAY,
+    entryCooldownMinutes: ENTRY_COOLDOWN_MINUTES,
+    maxLossStreak: MAX_LOSS_STREAK,
+    lossStreakCooldownMinutes: LOSS_STREAK_COOLDOWN_MINUTES,
+    volatilitySpikeAtrMultiplier: VOLATILITY_SPIKE_ATR_MULTIPLIER,
+    liquidityMin24hUSDT: LIQUIDITY_MIN_24H_USDT,
+    maxSpreadPct: MAX_SPREAD_PCT,
+    minRiskReward: MIN_RISK_REWARD,
+    botTimezone: BOT_TIMEZONE,
+    adminTokenConfigured: Boolean(BOT_ADMIN_TOKEN),
+    persistentStateFile: BOT_STATE_FILE,
+    mexcMinRequestGapMs: MEXC_MIN_REQUEST_GAP_MS,
+    mexcMaxRetries: MEXC_MAX_RETRIES,
+    candleCacheTtlsMs: CANDLE_CACHE_TTL_MS,
+    advancedSignalCacheTtlMs: ADVANCED_SIGNAL_CACHE_TTL_MS
+  },
+  allowedSymbols: ALLOWED_SYMBOLS,
+  realTradingEnabled: REAL_TRADING_ENABLED,
+  autoTradingEnabled: AUTO_TRADING_ENABLED,
+  safetyNote: "LIVE ENTRY: 1D/8H/6H/4H determine the main direction, 1H confirms it, and 15m is the entry timeframe. 5m is diagnostic only. Direction is locked at preflight and order time. Structure SL uses swing + ATR buffer with 0.8%-2.5% bounds. No profit percentage is guaranteed.",
+  symbolUniverse: {
+    source: symbolUniverseCache.source,
+    updatedAt: symbolUniverseCache.time ? new Date(symbolUniverseCache.time).toISOString() : null,
+    count: ALLOWED_SYMBOLS.length, targetCount: null, scanBatchSize: SCAN_BATCH_SIZE,
+    scanCycle, removedFromCoreSymbols: symbolUniverseCache.removed,
+    marketRanked: symbolUniverseCache.marketRanked
+  }
+}));
+
+app.get("/api/diagnostic", (req, res) => {
+  const result = lastAutoResult || {};
+  res.json({
+    success: true,
+    scannedSymbols: result.scannedSymbols ?? null,
+    reason: result.reason ?? null,
+    top5Diagnostic: Array.isArray(result.top5Diagnostic) ? result.top5Diagnostic : [],
+    settings: {
+      minSignalScore: MIN_SIGNAL_SCORE, minScoreEdge: MIN_SCORE_EDGE,
+      max15mEma21DistanceAtr: ENTRY_MAX_DISTANCE_E21_ATR,
+      triggerMaxDistanceAtr: ENTRY_TRIGGER_MAX_DISTANCE_ATR,
+      triggerMaxBars: ENTRY_TRIGGER_MAX_BARS,
+      breakoutLookback: BREAKOUT_LOOKBACK, breakoutBufferPct: BREAKOUT_BUFFER_PCT,
+      breakoutVolumeMultiplier: BREAKOUT_VOLUME_MULTIPLIER,
+      breakoutMinBodyAtr: BREAKOUT_MIN_BODY_ATR,
+      breakoutCloseLocationMin: BREAKOUT_CLOSE_LOCATION_MIN,
+      breakoutMaxExtensionAtr: BREAKOUT_MAX_EXTENSION_ATR,
+      earlyBreakoutEnabled: EARLY_BREAKOUT_ENABLED,
+      earlyBreakoutVolumeMultiplier: EARLY_BREAKOUT_VOLUME_MULTIPLIER,
+      earlyBreakoutMinBodyAtr: EARLY_BREAKOUT_MIN_BODY_ATR,
+      earlyBreakoutMinBodyRatio: EARLY_BREAKOUT_MIN_BODY_RATIO,
+      earlyBreakoutCloseLocationMin: EARLY_BREAKOUT_CLOSE_LOCATION_MIN,
+      earlyBreakoutMaxExtensionAtr: EARLY_BREAKOUT_MAX_EXTENSION_ATR,
+      earlyBreakoutMinScore: EARLY_BREAKOUT_MIN_SCORE,
+      scanBatchSize: SCAN_BATCH_SIZE, universeCount: ALLOWED_SYMBOLS.length, scanCycle
+    },
+    busy: autoBusy,
+    busyAgeMs: autoBusySince ? Math.max(0, Date.now() - autoBusySince) : 0,
+    lastAutoRun
+  });
+});
+
+app.get("/api/auto-status", (req, res) => res.json({
+  success: true,
+  autoTradingEnabled: AUTO_TRADING_ENABLED,
+  realTradingEnabled: REAL_TRADING_ENABLED,
+  lastAutoRun, lastAutoResult, busy: autoBusy,
+  busyAgeMs: autoBusySince ? Math.max(0, Date.now() - autoBusySince) : 0,
+  autoRunStaleMs: AUTO_RUN_STALE_MS,
+  lastTradeSignalCandle: Object.fromEntries(lastTradeSignalCandle),
+  lastSuccessfulEntry: lastSuccessfulEntry || tradeRiskState.lastEntryAudit || null,
+  riskState: resetDailyRiskState()
+}));
+
+app.get("/api/trade-manager-status", (req, res) => res.json({
+  success: true,
+  enabled: TRADE_MANAGER_ENABLED,
+  realTradingEnabled: REAL_TRADING_ENABLED,
+  intervalSeconds: TRADE_MANAGER_INTERVAL_SECONDS,
+  breakEven: { enabled: BREAK_EVEN_ENABLED, triggerPct: BREAK_EVEN_TRIGGER_PCT, offsetPct: BREAK_EVEN_OFFSET_PCT },
+  trailing: { enabled: TRAILING_STOP_ENABLED, triggerPct: TRAILING_TRIGGER_PCT, stopPct: TRAILING_STOP_PCT },
+  minStopDistancePct: MIN_STOP_DISTANCE_PCT,
+  lastRun: lastTradeManagerRun, lastResult: lastTradeManagerResult,
+  busy: tradeManagerBusy, history: tradeManagerHistory
+}));
+
+async function getTradeStats(days = 7, symbol = "") {
+  const safeDays = Math.min(90, Math.max(1, Number(days) || 7));
+  const sym = String(symbol || "").toUpperCase();
+  const cacheKey = `${safeDays}:${sym}`;
+  if (tradeStatsCache.value && tradeStatsCache.key === cacheKey && Date.now() - tradeStatsCache.time < TRADE_STATS_CACHE_TTL_MS) return tradeStatsCache.value;
+
+  const end = Date.now();
+  const start = end - safeDays * 24 * 60 * 60 * 1000;
+  const baseParams = { start_time: start, end_time: end, page_num: 1, page_size: 100 };
+  if (sym) baseParams.symbol = sym;
+
+  async function fetchPages(path, extra = {}) {
+    const out = [];
+    let page = 1, totalPages = 1;
+    do {
+      const data = await mexc("GET", path, { ...baseParams, ...extra, page_num: page }, true);
+      const payload = data?.data;
+      const rows = Array.isArray(payload) ? payload : (Array.isArray(payload?.resultList) ? payload.resultList : []);
+      out.push(...rows);
+      totalPages = Math.min(Number(payload?.totalPage) || 1, 10);
+      page++;
+    } while (page <= totalPages);
+    return out;
+  }
+
+  const [positions, stopOrders] = await Promise.all([
+    fetchPages("/api/v1/private/position/list/history_positions"),
+    fetchPages("/api/v1/private/stoporder/list/orders", { is_finished: 1 })
+  ]);
+
+  const closedPositions = positions.filter(p => Number(p?.state) === 3 || Number(p?.closeVol || 0) > 0 || Number(p?.closeAvgPrice || 0) > 0);
+  const longCount = closedPositions.filter(p => Number(p?.positionType) === 1).length;
+  const shortCount = closedPositions.filter(p => Number(p?.positionType) === 2).length;
+  const realizedPnl = closedPositions.reduce((sum, p) => sum + (num(p?.realised) || 0), 0);
+
+  const executedByPosition = new Map();
+  for (const o of stopOrders) {
+    if (Number(o?.state) !== 3 || Number(o?.isFinished) !== 1) continue;
+    const pid = String(o?.positionId || o?.id || "");
+    if (!pid) continue;
+    const trigger = Number(o?.triggerSide);
+    if (trigger !== 1 && trigger !== 2) continue;
+    const prev = executedByPosition.get(pid);
+    const t = Number(o?.updateTime || o?.createTime || 0);
+    if (!prev || t > prev.time) executedByPosition.set(pid, { time: t, triggerSide: trigger, symbol: o?.symbol || null, positionId: o?.positionId || null });
+  }
+  const tpPositions = [...executedByPosition.values()].filter(x => x.triggerSide === 1);
+  const slPositions = [...executedByPosition.values()].filter(x => x.triggerSide === 2);
+  const tpCount = tpPositions.length;
+  const slCount = slPositions.length;
+  const classified = new Set([...tpPositions, ...slPositions].map(x => String(x.positionId)));
+  const otherClosed = Math.max(0, closedPositions.length - classified.size);
+  const totalClosed = closedPositions.length;
+  const winRate = totalClosed ? tpCount / totalClosed * 100 : 0;
+
+  const value = {
+    success: true,
+    period: { days: safeDays, start: new Date(start).toISOString(), end: new Date(end).toISOString(), symbol: sym || "ALL" },
+    totalClosed, tpCount, slCount, otherClosed, longCount, shortCount,
+    realizedPnl: Number(realizedPnl.toFixed(8)),
+    winRatePct: Number(winRate.toFixed(2)),
+    note: "TP/SL counts come from MEXC executed stop-order history and are deduplicated by positionId.",
+    recent: closedPositions.slice(0, 20).map(p => ({
+      positionId: p?.positionId, symbol: p?.symbol,
+      direction: Number(p?.positionType) === 1 ? "LONG" : Number(p?.positionType) === 2 ? "SHORT" : "UNKNOWN",
+      realizedPnl: num(p?.realised), openAvgPrice: num(p?.openAvgPrice), closeAvgPrice: num(p?.closeAvgPrice),
+      createTime: p?.createTime || null, updateTime: p?.updateTime || null,
+      classification: executedByPosition.get(String(p?.positionId))?.triggerSide === 1 ? "TP" : executedByPosition.get(String(p?.positionId))?.triggerSide === 2 ? "SL" : "OTHER"
+    }))
+  };
+  tradeStatsCache = { time: Date.now(), key: cacheKey, value };
+  return value;
+}
+
+app.get("/api/trade-stats", async (req, res) => {
+  try { res.json(await getTradeStats(req.query.days || 7, req.query.symbol || "")); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post("/api/trade-manager-run", requireAdmin, async (req, res) => {
+  try {
+    const result = await tradeManagerOnce();
+    lastTradeManagerResult = result;
+    tradeManagerHistory = [{ time: new Date().toISOString(), result }, ...tradeManagerHistory].slice(0, 20);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/api/order", requireAdmin, async (req, res) => {
+  try {
+    const symbol = req.body?.symbol || SYMBOL;
+    const side = req.body?.side;
+    const result = await placeMarketOrder(symbol, side);
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/api/auto-run", requireAdmin, async (req, res) => {
+  const result = await autoTradeOnce();
+  lastAutoResult = result;
+  res.json(result);
+});
+
+// ============================================================
+// BOOT
+// ============================================================
+loadPersistentState();
+resetDailyRiskState();
+
+app.listen(PORT, () => {
+  console.log(`MEXC Futures Bot ${BOT_VERSION} listening on ${PORT}`);
+  console.log(`Real trading: ${REAL_TRADING_ENABLED}`);
+  console.log(`Auto trading: ${AUTO_TRADING_ENABLED}`);
+  console.log("SCAN SETTINGS", JSON.stringify({ scanBatchSize: SCAN_BATCH_SIZE, universeMin24hUSDT: UNIVERSE_MIN_24H_USDT, universeRefreshMs: SYMBOL_UNIVERSE_TTL_MS }));
+  console.log("BREAKOUT SETTINGS", JSON.stringify({
+    breakoutOnly: false, lookback: BREAKOUT_LOOKBACK, bufferPct: BREAKOUT_BUFFER_PCT,
+    volumeMultiplier: BREAKOUT_VOLUME_MULTIPLIER, minBodyAtr: BREAKOUT_MIN_BODY_ATR,
+    minBodyRatio: BREAKOUT_MIN_BODY_RATIO, closeLocationMin: BREAKOUT_CLOSE_LOCATION_MIN,
+    maxExtensionAtr: BREAKOUT_MAX_EXTENSION_ATR, minScore: BREAKOUT_MIN_SCORE
+  }));
+
+  refreshActiveSymbols(true)
+    .then(list => console.log("SYMBOL UNIVERSE", JSON.stringify({ count: list.length, sample: list.slice(0, 20) })))
+    .catch(e => console.log("SYMBOL UNIVERSE ERROR", e.message));
+
+  setTimeout(async () => {
+    const result = await autoTradeOnce();
+    lastAutoResult = result;
+    if (!result?.skipped) console.log("AUTO RESULT", JSON.stringify(result));
+  }, 5000);
+
+  setInterval(async () => {
+    const result = await autoTradeOnce();
+    lastAutoResult = result;
+    if (!result?.skipped) console.log("AUTO RESULT", JSON.stringify(result));
+  }, AUTO_INTERVAL_MINUTES * 60 * 1000);
+
+  setTimeout(async () => {
+    const result = await tradeManagerOnce();
+    lastTradeManagerResult = result;
+    tradeManagerHistory = [{ time: new Date().toISOString(), result }, ...tradeManagerHistory].slice(0, 20);
+    if (!result?.skipped) console.log("TRADE MANAGER", JSON.stringify(result));
+  }, 8000);
+
+  setInterval(async () => {
+    const result = await tradeManagerOnce();
+    lastTradeManagerResult = result;
+    tradeManagerHistory = [{ time: new Date().toISOString(), result }, ...tradeManagerHistory].slice(0, 20);
+    if (!result?.skipped) console.log("TRADE MANAGER", JSON.stringify(result));
+  }, TRADE_MANAGER_INTERVAL_SECONDS * 1000);
+});
