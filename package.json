@@ -1,15 +1,12 @@
 {
-  "name": "mexc-futures-trading-bot",
-  "version": "34.9.2-robust-pullback-entry",
-  "private": true,
+  "name": "mexc-futures-combo-bot",
+  "version": "1.0.0",
+  "description": "MEXC Futures Bot with EMA, MACD, and ATR on Railway",
   "main": "server.js",
-  "engines": {
-    "node": ">=20.0.0"
-  },
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.21.2"
+    "axios": "^1.6.0"
   }
 }
